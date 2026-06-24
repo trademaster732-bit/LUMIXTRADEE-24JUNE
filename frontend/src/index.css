@@ -1,0 +1,126 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Bloomberg-style trading terminal design system. All colors HSL. */
+
+@layer base {
+  :root {
+    /* Terminal palette */
+    --background: 0 0% 4%;
+    --foreground: 60 12% 92%;
+
+    --surface: 0 0% 7%;
+    --surface-elevated: 0 0% 10%;
+    --surface-hover: 0 0% 13%;
+
+    --card: 0 0% 7%;
+    --card-foreground: 60 12% 92%;
+
+    --popover: 0 0% 9%;
+    --popover-foreground: 60 12% 92%;
+
+    --primary: 45 100% 52%;          /* amber */
+    --primary-foreground: 0 0% 4%;
+
+    --secondary: 0 0% 14%;
+    --secondary-foreground: 60 12% 92%;
+
+    --muted: 0 0% 11%;
+    --muted-foreground: 45 8% 60%;
+
+    --accent: 142 84% 48%;            /* terminal green */
+    --accent-foreground: 0 0% 4%;
+
+    --destructive: 0 84% 56%;         /* sell red */
+    --destructive-foreground: 0 0% 98%;
+
+    --success: 142 84% 48%;
+    --success-foreground: 0 0% 4%;
+
+    --warning: 38 100% 55%;
+    --warning-foreground: 0 0% 4%;
+
+    --bull: 142 84% 48%;
+    --bear: 0 84% 56%;
+
+    --border: 0 0% 16%;
+    --border-strong: 45 30% 28%;
+    --input: 0 0% 12%;
+    --ring: 45 100% 52%;
+
+    --radius: 0.25rem;
+
+    --grid-line: 0 0% 14%;
+
+    --shadow-glow-amber: 0 0 24px hsl(45 100% 52% / 0.25);
+    --shadow-glow-green: 0 0 20px hsl(142 84% 48% / 0.3);
+    --shadow-glow-red: 0 0 20px hsl(0 84% 56% / 0.3);
+
+    --gradient-amber: linear-gradient(135deg, hsl(45 100% 52%), hsl(38 100% 50%));
+    --gradient-bull: linear-gradient(135deg, hsl(142 84% 48%), hsl(150 80% 40%));
+    --gradient-surface: linear-gradient(180deg, hsl(0 0% 7%), hsl(0 0% 5%));
+
+    --sidebar-background: 0 0% 5%;
+    --sidebar-foreground: 60 8% 75%;
+    --sidebar-primary: 45 100% 52%;
+    --sidebar-primary-foreground: 0 0% 4%;
+    --sidebar-accent: 0 0% 10%;
+    --sidebar-accent-foreground: 45 100% 52%;
+    --sidebar-border: 0 0% 13%;
+    --sidebar-ring: 45 100% 52%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  html, body, #root {
+    @apply bg-background text-foreground;
+    min-height: 100vh;
+  }
+  body {
+    font-feature-settings: "ss01", "cv11", "tnum";
+    background-image:
+      linear-gradient(hsl(var(--grid-line) / 0.5) 1px, transparent 1px),
+      linear-gradient(90deg, hsl(var(--grid-line) / 0.5) 1px, transparent 1px);
+    background-size: 48px 48px;
+    background-position: -1px -1px;
+  }
+  .font-mono { font-feature-settings: "tnum", "zero", "ss01"; }
+}
+
+@layer utilities {
+  .text-bull { color: hsl(var(--bull)); }
+  .text-bear { color: hsl(var(--bear)); }
+  .bg-bull { background-color: hsl(var(--bull)); }
+  .bg-bear { background-color: hsl(var(--bear)); }
+  .glow-amber { box-shadow: var(--shadow-glow-amber); }
+  .glow-green { box-shadow: var(--shadow-glow-green); }
+  .glow-red { box-shadow: var(--shadow-glow-red); }
+  .surface { background: hsl(var(--surface)); }
+  .surface-elevated { background: hsl(var(--surface-elevated)); }
+  .terminal-border { border: 1px solid hsl(var(--border)); }
+  .terminal-divider { border-top: 1px dashed hsl(var(--border-strong) / 0.6); }
+  .ticker-blink {
+    animation: blink 1s steps(2, start) infinite;
+  }
+  @keyframes blink { to { visibility: hidden; } }
+  @keyframes pulse-dot {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
+  .pulse-dot { animation: pulse-dot 1.6s ease-in-out infinite; }
+  .scanline::after {
+    content: "";
+    position: absolute; inset: 0;
+    background: repeating-linear-gradient(
+      to bottom,
+      transparent 0px,
+      transparent 3px,
+      hsl(0 0% 100% / 0.015) 4px
+    );
+    pointer-events: none;
+  }
+}
