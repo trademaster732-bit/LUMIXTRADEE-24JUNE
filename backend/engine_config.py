@@ -35,8 +35,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "atr_ratio": 10,
         "spread": 10,
     },
-    "min_score": 80,                     # global threshold (per-symbol override allowed)
-    "near_miss_lower": 75,               # log scores in [75, 79] as near-misses for telemetry
+    "min_score": 70,                     # global threshold (per-symbol override allowed)
+    "near_miss_lower": 65,               # log scores in [near_miss_lower, min_score) as near-misses
     "adx_threshold": 25.0,               # ADX > this → award the 15 points
     "vwap_max_distance_atr": 1.5,        # price within 1.5×ATR of VWAP earns the 10 points
 
@@ -56,19 +56,24 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # ───── FEATURE 4: Daily-Bias Filter ─────
     "daily_bias_enabled": True,
     "daily_bias_neutral_mode": "score_penalty",   # "score_penalty" | "block" | "carry_forward"
-    "daily_bias_neutral_penalty": 15,             # subtract from score when neutral (mode B)
+    "daily_bias_neutral_penalty": 5,              # subtract from score when neutral (mode B)
 
     # ───── FEATURE 5: ATR-Ratio Filter ─────
     "atr_ratio_min": 0.80,
     "atr_ratio_max": 2.00,
 
-    # ───── Symbol overrides — empty by default; admin can add any of these keys per symbol ─────
+    # ───── Symbol overrides — admin can add any of these keys per symbol ─────
+    # NOTE (2026-01 commercial tuning): re-calibrated after diagnostic showed the
+    # pre-fix metals threshold of 85 was mathematically unreachable during the
+    # H4/D1 history warm-up window. New floors target ≈20–25 trades/day across
+    # the basket while keeping the structural filters (HTF, ATR band, cooldowns)
+    # intact.
     "symbol_overrides": {
-        "XAUUSD": {"min_score": 85, "cooldown_min": 60},
-        "XAGUSD": {"min_score": 85, "cooldown_min": 60},
-        "EURUSD": {"min_score": 80, "cooldown_min": 45},
-        "GBPUSD": {"min_score": 80, "cooldown_min": 45},
-        "USDCAD": {"min_score": 75, "cooldown_min": 30},
+        "XAUUSD": {"min_score": 75, "cooldown_min": 60},
+        "XAGUSD": {"min_score": 75, "cooldown_min": 60},
+        "EURUSD": {"min_score": 75, "cooldown_min": 45},
+        "GBPUSD": {"min_score": 75, "cooldown_min": 45},
+        "USDCAD": {"min_score": 72, "cooldown_min": 30},
     },
 }
 
@@ -100,12 +105,23 @@ def invalidate_cache() -> None:
 
 
 async def save_engine_config(db, patch: Dict[str, Any], *, admin_id: Optional[str] = None) -> Dict[str, Any]:
-    """Merge-update the config doc. Returns the new merged doc."""
+    """Merge-update the config doc. Returns the new merged doc.
+
+    Merge semantics:
+      • ``score_weights`` and ``session_windows`` → deep-merged (one level) with
+        the existing doc so admins can patch individual keys.
+      • ``symbol_overrides`` → REPLACEMENT semantics. The full dict in the patch
+        becomes the new ``symbol_overrides`` (allowing removal of any entry by
+        omitting it). To keep an entry, callers must include it explicitly.
+      • Everything else → shallow override.
+    """
     existing = await db.engine_config.find_one({"_id": "global"}) or {}
-    # Top-level shallow merge; symbol_overrides + score_weights merge one level deep.
     merged = dict(existing)
     for k, v in patch.items():
-        if k in ("score_weights", "symbol_overrides", "session_windows") and isinstance(v, dict):
+        if k == "symbol_overrides":
+            # Authoritative replacement (allows removing entries).
+            merged[k] = dict(v) if isinstance(v, dict) else {}
+        elif k in ("score_weights", "session_windows") and isinstance(v, dict):
             base = dict(existing.get(k) or {})
             base.update(v)
             merged[k] = base
@@ -121,15 +137,31 @@ async def save_engine_config(db, patch: Dict[str, Any], *, admin_id: Optional[st
 
 
 def _merge_defaults(doc: Dict[str, Any]) -> Dict[str, Any]:
-    """Fill missing keys from DEFAULT_CONFIG so callers can read every key safely."""
+    """Fill missing keys from DEFAULT_CONFIG so callers can read every key safely.
+
+    2026-01 fix: ``symbol_overrides`` is now AUTHORITATIVE from the DB doc when
+    that key is explicitly present (even if empty/partial). Previously the
+    defaults dict was re-injected on every read, which made it impossible for
+    an admin to *remove* a per-symbol override (e.g. drop XAUUSD's hard-coded
+    85 floor). ``score_weights`` and ``session_windows`` keep the deep-merge
+    behavior because they are structurally tied to the scoring formula.
+    """
     out = dict(DEFAULT_CONFIG)
+    has_overrides_key = isinstance(doc, dict) and ("symbol_overrides" in doc)
     for k, v in (doc or {}).items():
-        if k in ("score_weights", "symbol_overrides", "session_windows") and isinstance(v, dict):
+        if k == "symbol_overrides":
+            # Authoritative from DB doc — no re-injection from defaults.
+            out[k] = dict(v) if isinstance(v, dict) else {}
+        elif k in ("score_weights", "session_windows") and isinstance(v, dict):
             merged = dict(DEFAULT_CONFIG.get(k) or {})
             merged.update(v)
             out[k] = merged
         else:
             out[k] = v
+    # When the DB doc has no symbol_overrides key at all, fall back to defaults
+    # (covers fresh installs and pre-fix legacy docs).
+    if not has_overrides_key:
+        out["symbol_overrides"] = dict(DEFAULT_CONFIG.get("symbol_overrides") or {})
     return out
 
 

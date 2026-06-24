@@ -228,7 +228,14 @@ def conservative_config() -> "StrategyV2Config":
         scalp_min_confidence=0.55,      # 0.78 → 0.55 — scalps need looser bar to be useful
         max_hold_minutes_scalp=30,      # P2 fix (2026-06): 60 → 30 — scalps resolve fast or not at all
         max_hold_minutes_swing=360,
-        require_displacement=True,      # keep — structural filter, not score-based
+        require_displacement=False,     # 2026-01 tuning: was True. The BOS-retest setup
+                                        # already requires HTF alignment + BOS structure +
+                                        # pullback into the broken level (i.e. 3 confirmations
+                                        # by construction). Hard-requiring displacement on top
+                                        # was the dominant cause of "no_setup (trending_*)"
+                                        # rejections. Displacement remains a confidence bonus
+                                        # via the score composition (see _setup_bos_retest).
+                                        # Net policy: HTF + at-least-2-of {pullback, BOS, displacement}.
         require_fvg_for_bos=False,      # was True; relaxing — FVG isn't always present on real BOS retests
         require_htf_alignment=True,     # keep — biggest single risk filter (Trade #2 protection)
         max_atr_ratio=1.8,              # 1.5 → 1.8 — allow more volatile bars (more setups in active markets)

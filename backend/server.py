@@ -2431,27 +2431,45 @@ async def _scan_and_persist(bots: List[dict]) -> int:
             _min_score = int(get_symbol_setting(_ec, _pair_up, "min_score", 80))
             _score.threshold = _min_score
             _score.approved = _score.total >= _min_score
-            log.info("[QUALITY-SCORE] %s %s · total=%d/%d · h4=%d h1=%d adx=%d vwap=%d sr=%d atr=%d spr=%d · bias=%s(-%d) · %s",
+            log.info("[QUALITY-SCORE] %s %s · total=%d/%d (raw=%d/%d) · h4=%d h1=%d adx=%d vwap=%d sr=%d atr=%d spr=%d · bias=%s(-%d) · missing=%s · %s",
                      _pair_up, sig.side, _score.total, _min_score,
+                     _score.raw_score, _score.available_weight,
                      _score.h4_trend, _score.h1_trend, _score.adx, _score.vwap,
                      _score.sr, _score.atr_ratio, _score.spread,
                      _bias_value, _score.daily_bias_penalty,
+                     ",".join(k for k, v in _score.missing_history.items() if v) or "none",
                      "APPROVED" if _score.approved else "REJECTED")
-            # Near-miss logging (75-79): keep for telemetry, don't fire.
-            _near_lo = int(_ec.get("near_miss_lower", 75))
+            # Near-miss logging: keep for telemetry, don't fire.
+            _near_lo = int(_ec.get("near_miss_lower", 65))
+            # Shared diagnostic snapshot persisted on EVERY score-gate outcome.
+            _scan_diag = {
+                "last_raw_score": _score.raw_score,
+                "last_normalized_score": _score.total,
+                "last_available_weight": _score.available_weight,
+                "last_missing_history": _score.missing_history,
+                "last_effective_min_score": _min_score,
+                "last_regime": _regime,
+            }
             if not _score.approved:
                 _is_near_miss = _near_lo <= _score.total < _min_score
                 _rej = f"quality_score:{_score.total}<{_min_score}" + (":near_miss" if _is_near_miss else "")
                 await db.bots.update_one({"_id": bot["_id"]}, {"$set": {
                     "last_scan_at": now_iso(), "last_scan_result": _rej,
                     "last_mode": _mode_badge, "last_quality_score": _score.total,
-                    "last_daily_bias": _bias_value}})
+                    "last_daily_bias": _bias_value,
+                    **_scan_diag}})
                 await _funnel_record(bot, _rej)
                 await db.filter_rejections.insert_one({
                     "ts": now_iso(), "bot_id": bot["_id"], "user_id": bot["user_id"],
                     "pair": _pair_up, "filter": "quality_score", "reason": _rej,
                     "score": _score.to_dict(), "side": sig.side, "near_miss": _is_near_miss,
                     "daily_bias": _bias_value,
+                    "raw_score": _score.raw_score,
+                    "normalized_score": _score.total,
+                    "available_weight": _score.available_weight,
+                    "missing_history": _score.missing_history,
+                    "effective_min_score": _min_score,
+                    "regime": _regime,
                 })
                 continue
             # FIX #2 — Block same-(pair, direction) duplicates fired by sibling bots
@@ -2623,6 +2641,9 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                 "last_scan_at": now_iso(),
                 "last_scan_result": f"signal_created:{sig.side} ({sig.confidence:.2f}) [{sig.mode}]",
                 "last_mode": _mode_badge,
+                "last_quality_score": _score.total,
+                "last_daily_bias": _bias_value,
+                **_scan_diag,
             }})
             await _funnel_record(bot, f"signal_created:{sig.side} ({sig.confidence:.2f}) [{sig.mode}]")
             created += 1

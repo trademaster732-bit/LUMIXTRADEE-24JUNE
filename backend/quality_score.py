@@ -39,6 +39,11 @@ class ScoreBreakdown:
     threshold: int = 0
     approved: bool = False
     reasons: List[str] = field(default_factory=list)   # human-readable per-factor justifications
+    # 2026-01 diagnostics — persist alongside every scan for forensic analysis
+    raw_score: int = 0                                  # un-normalized sum of available factors
+    available_weight: int = 100                         # sum of weights actually scored (factors not skipped)
+    missing_history: Dict[str, bool] = field(default_factory=dict)  # {"h4": bool, "d1": bool}
+    daily_bias_state: str = "neutral"                   # bullish | bearish | neutral | unknown
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -149,16 +154,22 @@ def aggregate_daily(candles_h1: List[Dict[str, float]]) -> List[Dict[str, float]
 
 
 def daily_bias(candles_h1: List[Dict[str, float]]) -> str:
-    """Return 'bullish' | 'bearish' | 'neutral' computed from D1 EMA21 vs EMA55.
-    Source: H1 candles aggregated into D1."""
+    """Return 'bullish' | 'bearish' | 'neutral' | 'unknown'.
+
+    'unknown' is returned when there is not enough reconstructed D1 history
+    (< 56 days) to compute EMA21/EMA55. Callers must treat 'unknown' as
+    "no signal" — it MUST NOT incur the neutral-bias score penalty, because
+    the cause is a warm-up gap, not market consolidation.
+    Source: H1 candles aggregated into D1.
+    """
     d1 = aggregate_daily(candles_h1)
     if len(d1) < 56:                       # need enough days for EMA55
-        return "neutral"
+        return "unknown"
     closes = [d["c"] for d in d1]
     ef = ema(closes, 21)
     es = ema(closes, 55)
     if not ef or not es:
-        return "neutral"
+        return "unknown"
     diff = ef[-1] - es[-1]
     # 0.05% band — neutral when EMAs are within 5 bp
     band = abs(closes[-1]) * 0.0005
@@ -189,18 +200,37 @@ def score_trade(
     side_want_h1 = "up" if side == "buy" else "down"
     side_want_h4 = side_want_h1
 
-    # 1. H4 trend
-    h4_trend = _trend_from_emas(candles_h4)
-    if h4_trend == side_want_h4:
-        b.h4_trend = int(w.get("h4_trend", 20))
-        b.reasons.append(f"H4 trend agrees ({h4_trend})")
+    # Track which factor weights are actually available (used for normalization).
+    # If a factor cannot be evaluated (e.g. <60 H4 bars), its weight is excluded
+    # from the denominator instead of silently awarded 0 — which previously made
+    # the 100-point scale unreachable during HTF warm-up.
+    w_h4 = int(w.get("h4_trend", 20))
+    w_h1 = int(w.get("h1_trend", 20))
+    w_adx = int(w.get("adx", 15))
+    w_vwap = int(w.get("vwap", 10))
+    w_sr = int(w.get("sr", 15))
+    w_atr = int(w.get("atr_ratio", 10))
+    w_spread = int(w.get("spread", 10))
+    available = w_h1 + w_adx + w_vwap + w_sr + w_atr + w_spread  # h4 added conditionally
+
+    # 1. H4 trend — UNKNOWN when history < 60 bars (excluded from total + denominator)
+    h4_short = len(candles_h4) < 60
+    if h4_short:
+        b.missing_history["h4"] = True
+        b.reasons.append("H4 trend unknown — history < 60 bars (excluded)")
     else:
-        b.reasons.append(f"H4 trend {h4_trend} vs side {side}")
+        available += w_h4
+        h4_trend = _trend_from_emas(candles_h4)
+        if h4_trend == side_want_h4:
+            b.h4_trend = w_h4
+            b.reasons.append(f"H4 trend agrees ({h4_trend})")
+        else:
+            b.reasons.append(f"H4 trend {h4_trend} vs side {side}")
 
     # 2. H1 trend
     h1_trend = _trend_from_emas(candles_h1)
     if h1_trend == side_want_h1:
-        b.h1_trend = int(w.get("h1_trend", 20))
+        b.h1_trend = w_h1
         b.reasons.append(f"H1 trend agrees ({h1_trend})")
     else:
         b.reasons.append(f"H1 trend {h1_trend} vs side {side}")
@@ -209,7 +239,7 @@ def score_trade(
     adx_vals = _adx(candles, 14)
     adx_now = adx_vals[-1] if adx_vals else 0.0
     if adx_now > float(cfg.get("adx_threshold", 25.0)):
-        b.adx = int(w.get("adx", 15))
+        b.adx = w_adx
         b.reasons.append(f"ADX {adx_now:.1f} > 25")
     else:
         b.reasons.append(f"ADX {adx_now:.1f} weak")
@@ -223,7 +253,7 @@ def score_trade(
         dist_atr = abs(last_close - vwap_now) / atr_now
         max_dist = float(cfg.get("vwap_max_distance_atr", 1.5))
         if dist_atr <= max_dist:
-            b.vwap = int(w.get("vwap", 10))
+            b.vwap = w_vwap
             b.reasons.append(f"VWAP {dist_atr:.2f}×ATR ≤ {max_dist}")
         else:
             b.reasons.append(f"VWAP {dist_atr:.2f}×ATR too far")
@@ -233,7 +263,7 @@ def score_trade(
     # 5. S/R reaction — the strategy_v2 S/R gate either passes the signal or flips it.
     #    "ok" (passed cleanly) earns the points; a flip or unknown does not.
     if sr_action == "ok":
-        b.sr = int(w.get("sr", 15))
+        b.sr = w_sr
         b.reasons.append("S/R clean")
     else:
         b.reasons.append(f"S/R action: {sr_action or 'unknown'}")
@@ -246,7 +276,7 @@ def score_trade(
         lo = float(cfg.get("atr_ratio_min", 0.80))
         hi = float(cfg.get("atr_ratio_max", 2.00))
         if lo <= ratio <= hi:
-            b.atr_ratio = int(w.get("atr_ratio", 10))
+            b.atr_ratio = w_atr
             b.reasons.append(f"ATR ratio {ratio:.2f} in band")
         else:
             b.reasons.append(f"ATR ratio {ratio:.2f} out of band [{lo}, {hi}]")
@@ -257,7 +287,7 @@ def score_trade(
         pct = (spread_at_fill / sl_dist) * 100.0
         # Award full points if spread is < 15% of SL distance (tight).
         if pct < 15.0:
-            b.spread = int(w.get("spread", 10))
+            b.spread = w_spread
             b.reasons.append(f"Spread {pct:.1f}% of SL")
         else:
             b.reasons.append(f"Spread {pct:.1f}% of SL too wide")
@@ -266,11 +296,28 @@ def score_trade(
         b.reasons.append("Spread unknown — neutral")
 
     # ───── Daily-bias penalty (Feature 4 — Option B: subtract points when neutral) ─────
+    # 'unknown' (D1 history < 56 days) is treated as "no information" — it does
+    # NOT incur the neutral penalty.
+    b.daily_bias_state = daily_bias_value or "unknown"
     if daily_bias_value == "neutral":
-        b.daily_bias_penalty = int(cfg.get("daily_bias_neutral_penalty", 15))
+        b.daily_bias_penalty = int(cfg.get("daily_bias_neutral_penalty", 5))
         b.reasons.append(f"Daily bias neutral — penalty {b.daily_bias_penalty}")
+    elif daily_bias_value == "unknown" or daily_bias_value is None:
+        b.missing_history["d1"] = True
+        b.reasons.append("Daily bias unknown — D1 history short (no penalty)")
 
+    # Raw sum of awarded factor points (pre-penalty, pre-normalization).
     raw = (b.h4_trend + b.h1_trend + b.adx + b.vwap + b.sr + b.atr_ratio + b.spread)
-    b.total = max(0, raw - b.daily_bias_penalty)
+    b.raw_score = max(0, raw - b.daily_bias_penalty)
+    b.available_weight = max(1, available)
+    # Normalize so the 0-100 scale (and the configured min_score) remain meaningful
+    # when a factor is excluded due to warm-up.
+    if available == 100:
+        b.total = b.raw_score
+    else:
+        b.total = int(round(b.raw_score * 100.0 / available))
+        b.reasons.append(
+            f"Normalized {b.raw_score}/{available} → {b.total}/100 (warm-up adjusted)"
+        )
     b.approved = b.total >= b.threshold
     return b
