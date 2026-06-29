@@ -10,7 +10,7 @@ import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { toast } from "sonner";
-import { Activity, Filter, Gauge, RefreshCw, RotateCcw, Save, ShieldAlert, Sliders, Target, Layers, Compass, Crosshair, TrendingUp } from "lucide-react";
+import { Activity, Filter, Gauge, RefreshCw, RotateCcw, Save, ShieldAlert, Sliders, Target, Layers, Compass, Crosshair, TrendingUp, Shield } from "lucide-react";
 
 type EngineConfig = {
   score_weights: Record<string, number>;
@@ -28,11 +28,12 @@ type EngineConfig = {
   atr_ratio_min: number;
   atr_ratio_max: number;
   symbol_overrides: Record<string, Record<string, number>>;
-  // Phase-2 / Modules 1-3
+  // Phase-2 / Modules 1-4
   entry_quality?: any;
   market_regime?: any;
   mtf_alignment?: any;
   adaptive_tp?: any;
+  adaptive_sl?: any;
   updated_at?: number;
 };
 
@@ -69,6 +70,7 @@ export default function EngineConfigPage() {
             <TabsTrigger value="regime" data-testid="ec-tab-regime"><Compass className="w-3 h-3 mr-1" /> REGIME</TabsTrigger>
             <TabsTrigger value="mtf" data-testid="ec-tab-mtf"><Layers className="w-3 h-3 mr-1" /> MTF</TabsTrigger>
             <TabsTrigger value="atp" data-testid="ec-tab-atp"><TrendingUp className="w-3 h-3 mr-1" /> ADAPTIVE-TP</TabsTrigger>
+            <TabsTrigger value="asl" data-testid="ec-tab-asl"><Shield className="w-3 h-3 mr-1" /> ADAPTIVE-SL</TabsTrigger>
             <TabsTrigger value="telemetry" data-testid="ec-tab-telemetry"><Activity className="w-3 h-3 mr-1" /> TELEMETRY</TabsTrigger>
           </TabsList>
           <TabsContent value="scoring" className="mt-4"><ScoringTab /></TabsContent>
@@ -79,6 +81,7 @@ export default function EngineConfigPage() {
           <TabsContent value="regime" className="mt-4"><MarketRegimeTab /></TabsContent>
           <TabsContent value="mtf" className="mt-4"><MTFAlignmentTab /></TabsContent>
           <TabsContent value="atp" className="mt-4"><AdaptiveTPTab /></TabsContent>
+          <TabsContent value="asl" className="mt-4"><AdaptiveSLTab /></TabsContent>
           <TabsContent value="telemetry" className="mt-4"><TelemetryTab /></TabsContent>
         </Tabs>
       </div>
@@ -867,3 +870,134 @@ function AdaptiveTPTab() {
     </div>
   );
 }
+
+/* ─────────── 10. ADAPTIVE SL TAB (Module 4) ─────────── */
+function AdaptiveSLTab() {
+  const { cfg, setCfg, loading, save } = useEngineConfig();
+  if (loading || !cfg) return <Panel><div className="py-8 text-center font-mono text-xs text-muted-foreground">— Loading… —</div></Panel>;
+  const asl = cfg.adaptive_sl || {};
+  const setASL = (patch: any) => setCfg({ ...cfg, adaptive_sl: { ...asl, ...patch } });
+  const setBE = (patch: any) => setASL({ break_even: { ...(asl.break_even || {}), ...patch } });
+  const setTrail = (patch: any) => setASL({ trailing: { ...(asl.trailing || {}), ...patch } });
+  const setExpand = (patch: any) => setASL({ dynamic_expansion: { ...(asl.dynamic_expansion || {}), ...patch } });
+  const setTighten = (patch: any) => setASL({ tightening: { ...(asl.tightening || {}), ...patch } });
+  const setExpRegime = (r: string, v: number | "") => {
+    const map = { ...((asl.dynamic_expansion || {}).per_regime || {}) };
+    if (v === "" || isNaN(Number(v))) delete map[r]; else map[r] = Number(v);
+    setExpand({ per_regime: map });
+  };
+  const setTightRegime = (r: string, v: number | "") => {
+    const map = { ...((asl.tightening || {}).per_regime || {}) };
+    if (v === "" || isNaN(Number(v))) delete map[r]; else map[r] = Number(v);
+    setTighten({ per_regime: map });
+  };
+  const expMap = (asl.dynamic_expansion || {}).per_regime || {};
+  const tiMap = (asl.tightening || {}).per_regime || {};
+  return (
+    <div className="space-y-4">
+      <div className="grid md:grid-cols-4 gap-4">
+        <Panel><Stat label="Engine" value={asl.enabled ? "ON" : "OFF"} delta={{ value: asl.enabled ? "active" : "strategy SL", positive: !!asl.enabled }} /></Panel>
+        <Panel><Stat label="ATR mult" value={asl.atr_multiplier ?? 1.5} /></Panel>
+        <Panel><Stat label="SL bounds (xATR)" value={`${asl.min_sl_atr ?? 0.5} - ${asl.max_sl_atr ?? 4.0}`} /></Panel>
+        <Panel><Stat label="Symbol overrides" value={Object.keys(asl.symbol_overrides || {}).length} /></Panel>
+      </div>
+      <Panel>
+        <div className="flex items-center gap-3 mb-3">
+          <Switch checked={!!asl.enabled} onCheckedChange={(v) => setASL({ enabled: v })} data-testid="asl-enabled" />
+          <Label className="text-sm">Enable Adaptive SL</Label>
+        </div>
+      </Panel>
+      <Panel>
+        <div className="font-mono text-[11px] tracking-widest text-primary mb-3">// PRIORITY ORDER (first valid candidate wins)</div>
+        <Input value={(asl.priority || []).join(",")}
+               placeholder="structure,swing,atr"
+               onChange={(e) => setASL({ priority: e.target.value.split(",").map(s => s.trim()).filter(Boolean) })}
+               data-testid="asl-priority" />
+        <div className="text-xs text-muted-foreground mt-2">Available: structure, swing, atr</div>
+      </Panel>
+      <Panel>
+        <div className="font-mono text-[11px] tracking-widest text-primary mb-3">// LEVEL STRATEGY PARAMS</div>
+        <div className="grid md:grid-cols-3 gap-4">
+          <NumField label="atr_multiplier" value={asl.atr_multiplier ?? 1.5} step={0.1} onChange={(v) => setASL({ atr_multiplier: v })} testid="asl-atr-mult" />
+          <NumField label="swing_lookback" value={asl.swing_lookback ?? 50} onChange={(v) => setASL({ swing_lookback: v })} testid="asl-swing-lb" />
+          <NumField label="structure_lookback" value={asl.structure_lookback ?? 40} onChange={(v) => setASL({ structure_lookback: v })} testid="asl-st-lb" />
+          <NumField label="swing_buffer (xATR)" value={asl.swing_buffer_atr ?? 0.2} step={0.05} onChange={(v) => setASL({ swing_buffer_atr: v })} testid="asl-buf" />
+          <NumField label="volatility_buffer (xATR)" value={asl.volatility_buffer_atr ?? 0.0} step={0.05} onChange={(v) => setASL({ volatility_buffer_atr: v })} testid="asl-vb" />
+          <NumField label="min_sl (xATR)" value={asl.min_sl_atr ?? 0.5} step={0.05} onChange={(v) => setASL({ min_sl_atr: v })} testid="asl-min" />
+          <NumField label="max_sl (xATR)" value={asl.max_sl_atr ?? 4.0} step={0.1} onChange={(v) => setASL({ max_sl_atr: v })} testid="asl-max" />
+        </div>
+      </Panel>
+      <Panel>
+        <div className="font-mono text-[11px] tracking-widest text-primary mb-3">// DYNAMIC EXPANSION (regime-aware; factor &gt; 1.0 widens SL)</div>
+        <div className="flex items-center gap-3 mb-3">
+          <Switch checked={!!(asl.dynamic_expansion || {}).enabled} onCheckedChange={(v) => setExpand({ enabled: v })} data-testid="asl-exp-enabled" />
+          <Label className="text-xs">Enable dynamic expansion</Label>
+        </div>
+        <div className="grid md:grid-cols-3 gap-3">
+          {REGIME_NAMES.map(r => (
+            <div key={r} className="flex items-center gap-2">
+              <Label className="w-32 text-xs font-mono">{r}</Label>
+              <Input type="number" step={0.05} value={expMap[r] ?? ""} placeholder="1.00"
+                     onChange={(e) => setExpRegime(r, e.target.value === "" ? "" : Number(e.target.value))}
+                     className="w-24" data-testid={`asl-exp-${r}`} />
+            </div>
+          ))}
+        </div>
+      </Panel>
+      <Panel>
+        <div className="font-mono text-[11px] tracking-widest text-primary mb-3">// TIGHTENING (regime-aware; factor &lt; 1.0 narrows SL)</div>
+        <div className="flex items-center gap-3 mb-3">
+          <Switch checked={!!(asl.tightening || {}).enabled} onCheckedChange={(v) => setTighten({ enabled: v })} data-testid="asl-ti-enabled" />
+          <Label className="text-xs">Enable tightening</Label>
+        </div>
+        <div className="grid md:grid-cols-3 gap-3">
+          {REGIME_NAMES.map(r => (
+            <div key={r} className="flex items-center gap-2">
+              <Label className="w-32 text-xs font-mono">{r}</Label>
+              <Input type="number" step={0.05} value={tiMap[r] ?? ""} placeholder="1.00"
+                     onChange={(e) => setTightRegime(r, e.target.value === "" ? "" : Number(e.target.value))}
+                     className="w-24" data-testid={`asl-ti-${r}`} />
+            </div>
+          ))}
+        </div>
+      </Panel>
+      <Panel>
+        <div className="font-mono text-[11px] tracking-widest text-primary mb-3">// BREAK-EVEN (bridge moves SL to entry once RR reached)</div>
+        <div className="flex items-center gap-3 mb-3">
+          <Switch checked={!!(asl.break_even || {}).enabled} onCheckedChange={(v) => setBE({ enabled: v })} data-testid="asl-be-enabled" />
+          <Label className="text-xs">Enable break-even</Label>
+        </div>
+        <div className="grid md:grid-cols-2 gap-4">
+          <NumField label="Activate at RR" value={(asl.break_even || {}).activate_at_rr ?? 1.0} step={0.1} onChange={(v) => setBE({ activate_at_rr: v })} testid="asl-be-rr" />
+          <NumField label="Lock-in (xATR)" value={(asl.break_even || {}).lock_pips_atr ?? 0.1} step={0.05} onChange={(v) => setBE({ lock_pips_atr: v })} testid="asl-be-lock" />
+        </div>
+      </Panel>
+      <Panel>
+        <div className="font-mono text-[11px] tracking-widest text-primary mb-3">// TRAILING STOP (bridge trails SL once RR reached)</div>
+        <div className="flex items-center gap-3 mb-3">
+          <Switch checked={!!(asl.trailing || {}).enabled} onCheckedChange={(v) => setTrail({ enabled: v })} data-testid="asl-trail-enabled" />
+          <Label className="text-xs">Enable trailing</Label>
+        </div>
+        <div className="grid md:grid-cols-2 gap-4">
+          <NumField label="Activate at RR" value={(asl.trailing || {}).activate_at_rr ?? 1.5} step={0.1} onChange={(v) => setTrail({ activate_at_rr: v })} testid="asl-trail-rr" />
+          <NumField label="Trail distance (xATR)" value={(asl.trailing || {}).trail_distance_atr ?? 1.0} step={0.1} onChange={(v) => setTrail({ trail_distance_atr: v })} testid="asl-trail-dist" />
+        </div>
+      </Panel>
+      <SymbolOverridesEditor
+        label="Adaptive SL"
+        ovs={asl.symbol_overrides || {}}
+        columns={[
+          { key: "atr_multiplier", type: "number", placeholder: "1.5" },
+          { key: "max_sl_atr", type: "number", placeholder: "4.0" },
+          { key: "min_sl_atr", type: "number", placeholder: "0.5" },
+        ]}
+        onChange={(next) => setASL({ symbol_overrides: next })}
+        testidPrefix="asl-sym"
+      />
+      <div className="flex gap-3">
+        <Button onClick={() => save({ adaptive_sl: cfg.adaptive_sl } as any)} data-testid="save-asl"><Save className="w-4 h-4 mr-2" /> Save Adaptive-SL</Button>
+      </div>
+    </div>
+  );
+}
+

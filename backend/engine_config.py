@@ -242,6 +242,56 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         },
     },
 
+    # ───── MODULE 4 (2026-01): Professional Stop Loss Engine ─────
+    # Priority-ordered SL chooser + modifiers + post-trade management payload.
+    # Default OFF — opt-in to preserve existing strategy_v2 SL behavior.
+    # See adaptive_sl.py for the full evaluation chain.
+    "adaptive_sl": {
+        "enabled": False,
+        "priority": ["structure", "swing", "atr"],
+        "atr_multiplier": 1.5,
+        "swing_lookback": 50,
+        "structure_lookback": 40,
+        "swing_buffer_atr": 0.20,            # extra cushion beyond the picked swing/structure level
+        "volatility_buffer_atr": 0.0,        # static buffer added on top (× ATR)
+        # Distance clamps (× ATR) — prevents broker rejections + runaway SLs.
+        "min_sl_atr": 0.50,
+        "max_sl_atr": 4.00,
+        # Regime-aware dynamic expansion (>1 widens SL). Keys are regimes from Module 1.
+        "dynamic_expansion": {
+            "enabled": False,
+            "per_regime": {
+                "high_volatility": 1.25,
+                "breakout": 1.15,
+            },
+        },
+        # Regime-aware tightening (<1 tightens SL).
+        "tightening": {
+            "enabled": False,
+            "per_regime": {
+                "low_volatility": 0.85,
+                "range": 0.90,
+            },
+        },
+        # Break-even — bridge moves SL to entry once X RR is reached.
+        "break_even": {
+            "enabled": False,
+            "activate_at_rr": 1.0,
+            "lock_pips_atr": 0.10,           # SL parked at entry + lock_pips_atr × ATR (profit side)
+        },
+        # Trailing stop — bridge trails SL at Y × ATR once Z × RR is reached.
+        "trailing": {
+            "enabled": False,
+            "activate_at_rr": 1.5,
+            "trail_distance_atr": 1.0,
+        },
+        # Per-symbol overrides — any base key can be overridden.
+        "symbol_overrides": {
+            "XAUUSD": {"atr_multiplier": 2.0, "max_sl_atr": 5.0},
+            "XAGUSD": {"atr_multiplier": 2.0, "max_sl_atr": 5.0},
+        },
+    },
+
     # ───── Symbol overrides — admin can add any of these keys per symbol ─────
     # NOTE (2026-01 commercial tuning): re-calibrated after diagnostic showed the
     # pre-fix metals threshold of 85 was mathematically unreachable during the
@@ -319,7 +369,7 @@ async def save_engine_config(db, patch: Dict[str, Any], *, admin_id: Optional[st
         if k == "symbol_overrides":
             # Authoritative replacement (allows removing entries).
             merged[k] = dict(v) if isinstance(v, dict) else {}
-        elif k in ("entry_quality", "market_regime", "mtf_alignment", "adaptive_tp") and isinstance(v, dict):
+        elif k in ("entry_quality", "market_regime", "mtf_alignment", "adaptive_tp", "adaptive_sl") and isinstance(v, dict):
             merged[k] = _deep_update(existing.get(k) or {}, v)
         elif k in ("score_weights", "session_windows") and isinstance(v, dict):
             base = dict(existing.get(k) or {})
@@ -353,7 +403,7 @@ def _merge_defaults(doc: Dict[str, Any]) -> Dict[str, Any]:
         if k == "symbol_overrides":
             # Authoritative from DB doc — no re-injection from defaults.
             out[k] = dict(v) if isinstance(v, dict) else {}
-        elif k in ("entry_quality", "market_regime", "mtf_alignment", "adaptive_tp") and isinstance(v, dict):
+        elif k in ("entry_quality", "market_regime", "mtf_alignment", "adaptive_tp", "adaptive_sl") and isinstance(v, dict):
             out[k] = _deep_update(DEFAULT_CONFIG.get(k) or {}, v)
         elif k in ("score_weights", "session_windows") and isinstance(v, dict):
             merged = dict(DEFAULT_CONFIG.get(k) or {})

@@ -2812,6 +2812,37 @@ async def _scan_and_persist(bots: List[dict]) -> int:
             # (partial TP) and trailing payload are persisted as extra fields
             # for the bridge to consume. Default OFF; opt-in via admin endpoint.
             # ═════════════════════════════════════════════════════════════════
+            # ═════════════════════════════════════════════════════════════════
+            # MODULE 4 (2026-01) — Professional Stop Loss Engine.
+            # Replaces sig.sl with a priority-ordered SL (structure/swing/atr) +
+            # volatility buffer + regime-aware dynamic expansion / tightening +
+            # distance clamps. Also emits break-even + trailing payload that the
+            # bridge consumes (persisted as `sl_management` on the signal doc).
+            # Default OFF; sig.sl preserved when disabled.
+            # ═════════════════════════════════════════════════════════════════
+            from adaptive_sl import compute_adaptive_sl
+            _asl_cfg = _ec.get("adaptive_sl") or {}
+            _asl_atr_now = _atr_arr_pre[-1] if _atr_arr_pre else 0.0
+            _asl = compute_adaptive_sl(
+                side=sig.side, symbol=_pair_up,
+                entry=sig.entry, existing_sl=sig.sl, atr_now=_asl_atr_now,
+                candles=candles, cfg=_asl_cfg,
+                market_regime=_mr.regime if _mr_cfg.get("enabled", True) else None,
+            )
+            _asl_diag = {
+                "adaptive_sl_enabled": _asl.enabled,
+                "sl_strategy": _asl.primary_strategy,
+                "sl_candidates": _asl.candidates,
+                "sl_distance_atr": _asl.sl_distance_atr,
+                "sl_bounds_clamped": _asl.bounds_clamped,
+                "sl_volatility_buffer_atr": _asl.volatility_buffer_atr,
+                "sl_expansion_factor": _asl.dynamic_expansion_factor,
+                "sl_tightening_factor": _asl.tightening_factor,
+                "sl_symbol_override_used": _asl.symbol_override_used,
+                "sl_reasons": _asl.reasons,
+            }
+            if _asl.enabled and _asl.primary_sl is not None:
+                sig.sl = float(_asl.primary_sl)   # mutate before adaptive_tp computes RR
             from adaptive_tp import compute_adaptive_tp
             _atp_cfg = _ec.get("adaptive_tp") or {}
             _atp_atr_now = _atr_arr_pre[-1] if _atr_arr_pre else 0.0
@@ -2865,6 +2896,9 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                 "adaptive_tp": _atp_diag,
                 "tp_levels": _atp.tp_levels,       # null when partial_tp disabled
                 "trailing": _atp.trailing,         # null when trailing disabled
+                # Module-4 (2026-01): adaptive SL audit + bridge management payload
+                "adaptive_sl": _asl_diag,
+                "sl_management": _asl.sl_management,   # null when break_even + trailing both off
             })
             # Fire-and-forget Telegram alert (admin-level channel for v1)
             try:
