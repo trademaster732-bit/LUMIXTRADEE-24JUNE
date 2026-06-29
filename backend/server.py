@@ -2465,6 +2465,68 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                 continue
 
             # ═════════════════════════════════════════════════════════════════
+            # MODULE 2 (2026-01) — Multi-Timeframe Alignment.
+            # Evaluates D1 (reconstructed from H1), H4, H1, M15. Each enabled
+            # timeframe contributes its `weight` to a weighted alignment %.
+            # Two hard gates: (a) alignment < min_pct, (b) D1 vs M15 strong
+            # opposite disagreement. See mtf_alignment.py.
+            # ═════════════════════════════════════════════════════════════════
+            from mtf_alignment import evaluate_mtf_alignment
+            from quality_score import aggregate_daily
+            _mtf_cfg = _ec.get("mtf_alignment") or {}
+            # Reuse the H4/H1 candle fetches already cached upstream.
+            try:
+                _mtf_h1 = await fetch_candles(bot["pair"], "H1", 1500)
+            except Exception:
+                _mtf_h1 = []
+            try:
+                _mtf_h4 = await fetch_candles(bot["pair"], "H4", 300)
+            except Exception:
+                _mtf_h4 = []
+            try:
+                _mtf_m15 = await fetch_candles(bot["pair"], "M15", 200)
+            except Exception:
+                _mtf_m15 = []
+            _mtf_d1 = aggregate_daily(_mtf_h1) if _mtf_h1 else []
+            _mtf = evaluate_mtf_alignment(
+                side=sig.side,
+                candles_d1=_mtf_d1, candles_h4=_mtf_h4,
+                candles_h1=_mtf_h1, candles_m15=_mtf_m15,
+                mtf_cfg=_mtf_cfg,
+            )
+            # Compact diagnostic payload (full per-TF evals + scalars).
+            _mtf_diag = {
+                "mtf_alignment_pct": _mtf.alignment_pct,
+                "mtf_aligned_count": _mtf.aligned_count,
+                "mtf_enabled_count": _mtf.enabled_count,
+                "mtf_momentum_agree_count": _mtf.momentum_agree_count,
+                "mtf_htf_dir": _mtf.htf_dir,
+                "mtf_ltf_dir": _mtf.ltf_dir,
+                "mtf_htf_ltf_disagree": _mtf.htf_ltf_disagree,
+                "mtf_passed": _mtf.passed,
+                "mtf_rejection_reason": _mtf.rejection_reason,
+                "mtf_evaluations": _mtf.to_dict()["evaluations"],
+            }
+            if _mtf_cfg.get("enabled", True) and not _mtf.passed:
+                _rej = f"mtf_alignment:{_mtf.rejection_reason}"
+                await db.bots.update_one({"_id": bot["_id"]}, {"$set": {
+                    "last_scan_at": now_iso(), "last_scan_result": _rej,
+                    "last_mode": _mode_badge,
+                    "last_daily_bias": _bias_value,
+                    **_mr_diag,
+                    **_mtf_diag,
+                }})
+                await _funnel_record(bot, _rej)
+                await db.filter_rejections.insert_one({
+                    "ts": now_iso(), "bot_id": bot["_id"], "user_id": bot["user_id"],
+                    "pair": _pair_up, "filter": "mtf_alignment", "reason": _rej,
+                    "side": sig.side, "regime": _regime, "daily_bias": _bias_value,
+                    **_mr_diag,
+                    **_mtf_diag,
+                })
+                continue
+
+            # ═════════════════════════════════════════════════════════════════
             # PHASE-2 (2026-01) — Entry Quality Engine.
             # Four post-strategy gates focused on ENTRY TIMING (not direction).
             # Each gate is independently toggleable via engine_config.entry_quality.
@@ -2522,6 +2584,7 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                     "last_mode": _mode_badge,
                     "last_daily_bias": _bias_value,
                     **_mr_diag,
+                    **_mtf_diag,
                     **_eq_diag,
                 }})
                 await _funnel_record(bot, _rej)
@@ -2530,6 +2593,7 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                     "pair": _pair_up, "filter": "entry_quality", "reason": _rej,
                     "side": sig.side, "regime": _regime, "daily_bias": _bias_value,
                     **_mr_diag,
+                    **_mtf_diag,
                     **_eq_diag,
                 })
                 continue
@@ -2583,6 +2647,10 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                 "last_missing_history": _score.missing_history,
                 "last_effective_min_score": _min_score,
                 "last_regime": _regime,
+                # Module-1 market regime classification
+                **_mr_diag,
+                # Module-2 multi-timeframe alignment
+                **_mtf_diag,
                 # Phase-2 entry-quality breakdown (single source of truth)
                 **_eq_diag,
             }

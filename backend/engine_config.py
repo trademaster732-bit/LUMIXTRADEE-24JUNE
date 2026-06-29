@@ -162,6 +162,32 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         },
     },
 
+    # ───── MODULE 2 (2026-01): Multi-Timeframe Alignment ─────
+    # Evaluates D1, H4, H1, M15 in parallel — each TF reports direction,
+    # strength (ADX), EMA-angle (bps slope) and momentum direction. Weighted
+    # alignment % must clear `min_alignment_pct` AND (optionally) D1 vs M15
+    # must not be in strong opposite agreement. Every TF is individually
+    # toggleable / tunable. See mtf_alignment.py for the full evaluation.
+    "mtf_alignment": {
+        "enabled": True,
+        "timeframes": {
+            "D1":  {"enabled": True,  "weight": 30, "min_strength_adx": 18.0, "min_ema_angle_bps": 0.5},
+            "H4":  {"enabled": True,  "weight": 30, "min_strength_adx": 20.0, "min_ema_angle_bps": 0.4},
+            "H1":  {"enabled": True,  "weight": 25, "min_strength_adx": 22.0, "min_ema_angle_bps": 0.3},
+            "M15": {"enabled": True,  "weight": 15, "min_strength_adx": 25.0, "min_ema_angle_bps": 0.2},
+        },
+        # Weighted-alignment threshold (0-100). Below this → reject.
+        # Default 60 means "≥60 % of enabled timeframe weight must agree".
+        "min_alignment_pct": 60,
+        # Strong-disagreement gate: if D1 AND M15 are BOTH decisive (direction
+        # ≠ flat and ADX ≥ min_strength) but point opposite ways → reject.
+        "htf_ltf_disagreement_reject": True,
+        # Optional momentum-agreement gate: require ADX rising and EMA21 sloping
+        # the right way on at least N timeframes.
+        "require_momentum_agreement": False,
+        "min_momentum_agreement_count": 2,
+    },
+
     # ───── Symbol overrides — admin can add any of these keys per symbol ─────
     # NOTE (2026-01 commercial tuning): re-calibrated after diagnostic showed the
     # pre-fix metals threshold of 85 was mathematically unreachable during the
@@ -239,7 +265,7 @@ async def save_engine_config(db, patch: Dict[str, Any], *, admin_id: Optional[st
         if k == "symbol_overrides":
             # Authoritative replacement (allows removing entries).
             merged[k] = dict(v) if isinstance(v, dict) else {}
-        elif k in ("entry_quality", "market_regime") and isinstance(v, dict):
+        elif k in ("entry_quality", "market_regime", "mtf_alignment") and isinstance(v, dict):
             merged[k] = _deep_update(existing.get(k) or {}, v)
         elif k in ("score_weights", "session_windows") and isinstance(v, dict):
             base = dict(existing.get(k) or {})
@@ -273,7 +299,7 @@ def _merge_defaults(doc: Dict[str, Any]) -> Dict[str, Any]:
         if k == "symbol_overrides":
             # Authoritative from DB doc — no re-injection from defaults.
             out[k] = dict(v) if isinstance(v, dict) else {}
-        elif k in ("entry_quality", "market_regime") and isinstance(v, dict):
+        elif k in ("entry_quality", "market_regime", "mtf_alignment") and isinstance(v, dict):
             out[k] = _deep_update(DEFAULT_CONFIG.get(k) or {}, v)
         elif k in ("score_weights", "session_windows") and isinstance(v, dict):
             merged = dict(DEFAULT_CONFIG.get(k) or {})
