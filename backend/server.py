@@ -3019,6 +3019,65 @@ async def admin_filter_stats(days: int = 7, admin: dict = Depends(get_current_ad
             "details": rows}
 
 
+@api.get("/admin/recent-rejections")
+async def admin_recent_rejections(
+    filter: Optional[str] = None,
+    pair: Optional[str] = None,
+    limit: int = 20,
+    admin: dict = Depends(get_current_admin),
+):
+    """Live diagnostic feed: most-recent filter rejections, optionally narrowed
+    by `filter` name (e.g. 'market_regime', 'mtf_alignment', 'entry_quality',
+    'quality_score') and/or pair. Returns the full diagnostic payload as
+    persisted by the scanner — used by the Admin Engine UI tabs to show
+    real-world examples for each module.
+    """
+    q: Dict[str, Any] = {}
+    if filter:
+        q["filter"] = filter
+    if pair:
+        q["pair"] = pair.upper()
+    rows = await db.filter_rejections.find(q).sort("ts", -1).to_list(
+        max(1, min(limit, 200))
+    )
+    for r in rows:
+        # Strip ObjectId and user_id (sensitive) before returning.
+        r.pop("_id", None)
+        r.pop("user_id", None)
+    return {"count": len(rows), "rejections": rows}
+
+
+@api.get("/admin/recent-signals")
+async def admin_recent_signals(
+    pair: Optional[str] = None,
+    limit: int = 30,
+    admin: dict = Depends(get_current_admin),
+):
+    """Most-recent approved signals (across all bots) including Module-3
+    adaptive-TP diagnostics. Powers the 'Adaptive TP' tab's live monitor."""
+    q: Dict[str, Any] = {}
+    if pair:
+        q["pair"] = pair.upper()
+    rows = await db.signals.find(q).sort("created_at", -1).to_list(
+        max(1, min(limit, 200))
+    )
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        out.append({
+            "id": r.get("_id"),
+            "pair": r.get("pair"), "side": r.get("side"),
+            "entry": r.get("entry"), "sl": r.get("sl"), "tp": r.get("tp"),
+            "lot": r.get("lot"), "mode": r.get("mode"),
+            "regime": r.get("regime"), "session": r.get("session"),
+            "status": r.get("status"), "created_at": r.get("created_at"),
+            "adaptive_tp": r.get("adaptive_tp"),
+            "tp_levels": r.get("tp_levels"),
+            "trailing": r.get("trailing"),
+            "quality_score_total": (r.get("quality_score") or {}).get("total"),
+        })
+    return {"count": len(out), "signals": out}
+
+
 @api.get("/admin/symbol-metrics")
 async def admin_symbol_metrics(days: int = 7, admin: dict = Depends(get_current_admin)):
     """Per-symbol performance for the last `days` days. Used by the Phase-2

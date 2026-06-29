@@ -1,80 +1,67 @@
 # LumixTrade — PRD
 
 ## Phases completed
-- Phase 0: Deploy as-is from user ZIP
+- Phase 0: Deploy as-is
 - Phase 1: Diagnostic + commercial tuning
 - Phase 2: Entry Quality Engine
-- Phase 3 / Module 1: Market Regime Detection (6 regimes + per-symbol whitelists)
-- Phase 3 / Module 2: Multi-Timeframe Alignment (D1/H4/H1/M15)
-- **Phase 3 / Module 3: Adaptive Take Profit Engine** ← this session
+- Phase 3 / Module 1: Market Regime Detection
+- Phase 3 / Module 2: Multi-Timeframe Alignment
+- Phase 3 / Module 3: Adaptive Take Profit Engine
+- **Phase 3 / Admin Control Center (UI parity)** ← this session
 
-## Module 3 — Adaptive Take Profit Engine (NEW, 2026-01)
+## Admin Control Center (NEW, 2026-01)
 
-**New file:** `/app/backend/adaptive_tp.py` (~330 LOC, self-contained). **Stop loss is NEVER modified.**
+**File touched:** `/app/frontend/src/pages/app/EngineConfig.tsx`. **New backend endpoints:** `/api/admin/recent-rejections` and `/api/admin/recent-signals`.
 
-### 7 strategies, priority-ordered:
-1. **`static_rr`** — TP = entry ± `static_rr` × SL distance.
-2. **`atr`** — TP = entry ± `atr_multiplier` × ATR.
-3. **`swing`** — TP = nearest swing-high (buy) / swing-low (sell) from `_swings()` pivots, `swing_lookback` bars.
-4. **`sr`** — TP = nearest clustered S/R level (≥2 pivots within `sr_cluster_atr` × ATR), `sr_lookback` bars.
-5. **`structure`** — 1:1 measured-move projection from the last impulse leg's swing-low (buy) / swing-high (sell).
-6. **`partial_tp`** — generates `tp_levels[]` (rr + close_pct + tp price) — persisted as **auxiliary** on signal doc for the bridge to consume; does NOT replace primary TP.
-7. **`trailing`** — generates `trailing{}` payload (activate_at_rr, trail_distance_atr) — persisted as **auxiliary** on signal doc.
+### Tabs in the Engine Configuration page (now 9 total):
+| Tab | Module / Phase | Status |
+|---|---|---|
+| SCORE | Phase-1 weights + thresholds (now 8 weights incl. `entry_confirmation`) | extended |
+| COOLDOWN | Phase-1 cooldown + active sessions | unchanged |
+| FILTERS | Phase-1 sessions + daily-bias + ATR ratio | unchanged |
+| PER-SYMBOL | Phase-1 per-symbol overrides | unchanged |
+| **ENTRY-Q** | **Phase-2 — Entry Quality Engine** | NEW |
+| **REGIME** | **Module 1 — Market Regime Detection** | NEW |
+| **MTF** | **Module 2 — Multi-Timeframe Alignment** | NEW |
+| **ADAPTIVE-TP** | **Module 3 — Adaptive Take Profit Engine** | NEW |
+| TELEMETRY | Cross-module rejection stats | unchanged |
 
-### Orchestrator behavior:
-- Walks `priority` list — FIRST strategy that returns a valid TP wins.
-- All 5 level-strategy candidates are recorded in diagnostics (`tp_candidates`) for forensics.
-- Sanity bounds: TP is widened to `min_rr_floor` if too tight, clipped to `max_rr_cap` if too far.
-- Fallback: if every strategy fails, falls back to `static_rr@min_rr_floor`.
+### Each new tab includes:
+- **Master enable/disable toggle**
+- **Hero stat cards** (engine status, key thresholds, counts)
+- **Configuration controls** — toggles, number inputs, selects, list inputs
+- **Per-symbol overrides editor** (Adaptive TP, Market Regime symbol_preferences)
+- **Save button** — sends a recursive partial patch via existing `PUT /api/admin/engine-config`
+- **Live diagnostic widget** — counts + per-pair breakdown + last-10 example rejections (via new `/api/admin/recent-rejections?filter=<module>`)
+- **Adaptive-TP tab** additionally shows per-strategy usage from last 30 signals (`/api/admin/recent-signals`)
 
-### Per-symbol overrides (`adaptive_tp.symbol_overrides.<symbol>`):
-Default shipped:
-- **XAUUSD / XAGUSD** → `priority=[structure, swing, atr]`, `atr_multiplier=3.0`, `min_rr_floor=1.8`
-- **EURUSD / GBPUSD** → `priority=[sr, swing, structure, atr]`
+### Shared widgets:
+- `<LiveRejections filter="..." />` — pulls `filter-stats` + `recent-rejections` for any module
+- `<SymbolOverridesEditor>` — generic per-symbol matrix editor (used by Adaptive TP; designed to be reusable for Modules 4-7)
 
-### Default config: `enabled: false`
-Backward-compatible. Existing `sig.tp` (with strategy_v2's own min-RR enforcement) is used until admin opts in.
+### Verified live on preview:
+- Lint clean (only pre-existing useEffect warnings, no new ones)
+- Webpack compiled successfully
+- 5 tabs screenshotted end-to-end:
+  - SCORE shows new `ENTRY_CONFIRMATION=15` weight; sum=100 balanced
+  - ENTRY-Q shows master toggle, all 4 sub-modules, metals + forex profiles
+  - REGIME shows 6 regimes (5/6 on, low_volatility default OFF), all 9 symbols in preference editor
+  - MTF shows D1/H4/H1/M15 rows + 3 global gates + live monitor
+  - ADAPTIVE-TP shows priority editor, 8 params, partial-TP table, trailing controls, symbol overrides matrix, live strategy-usage widget
+- Login via admin@bot.com/password works through the rendered shell
 
-### Wired into `server.py` immediately BEFORE `db.signals.insert_one`:
-- `sig.tp` is replaced with `_atp.primary_tp` when enabled.
-- New signal-doc fields persisted: `adaptive_tp{diag}`, `tp_levels[]`, `trailing{}`.
-- `notify_svc.notify(..., tp=sig.tp)` automatically gets the new TP (sig.tp is mutated).
-
-### Diagnostics persisted on EVERY approved signal:
-`adaptive_tp_enabled, tp_strategy (picked), tp_candidates (all 5), tp_rr_realized, tp_rr_floor_applied, tp_rr_cap_applied, tp_symbol_override_used, tp_reasons (full reasoning chain)`
-
-### Explicitly NOT touched
-- **Stop loss** (every gate, every code path)
-- Risk management, lot sizing, sessions, ATR band, cooldown, daily-bias, quality-score weights
-- Bridge endpoints (the bridge just sees new optional fields on signal docs — `tp_levels` and `trailing` — and can ignore them safely)
-- Auth, frontend, all Phase-1/Phase-2/Module-1/Module-2 logic
-
-## Verification (preview env)
-- Lint clean.
-- 8 unit tests covering: individual strategies, orchestrator default, engine-disabled passthrough, XAUUSD symbol override (min_rr_floor 1.5→1.8), partial-TP plan generation, trailing payload, SELL-on-uptrend fallback, min-RR floor enforcement.
-- Recursive admin patch: enabled `adaptive_tp.enabled=true` + tightened ONLY `XAUUSD.min_rr_floor` — every untouched field preserved (XAUUSD.priority, XAUUSD.atr_multiplier, XAGUSD entirely, partial_tp.levels).
-- Reset-defaults works.
-- Full regression of all prior subsystems passed.
+## Pattern established for future modules (4–7)
+Every new module from this point forward will ship with:
+1. Self-contained backend file (`<module>.py`)
+2. Recursive-mergeable config block in `engine_config.py`
+3. Persisted diagnostics on every scan
+4. **Dedicated Admin tab** in `EngineConfig.tsx` with: master toggle → config controls → per-symbol overrides (if applicable) → save button → live monitor section (using `<LiveRejections filter="<module>" />`).
 
 ## Production deploy notes
-Old engine_config docs lack `adaptive_tp` → defaults auto-apply with `enabled=false`. To opt in:
-```bash
-curl -X PUT https://lumixtrade.live/api/admin/engine-config \
-  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"adaptive_tp":{"enabled":true}}'
-```
-
-To enable partial closes + trailing on top:
-```bash
-curl -X PUT https://lumixtrade.live/api/admin/engine-config \
-  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"adaptive_tp":{"enabled":true,"partial_tp":{"enabled":true},"trailing":{"enabled":true}}}'
-```
-
-## Bridge compatibility note
-- `tp_levels` and `trailing` are optional fields on the signal doc. Bridges built before Module 3 will simply ignore them and execute the primary `tp` (which already incorporates the adaptive choice). **No bridge update is required** to start benefiting from Module 3; partial-closes and trailing only activate once the bridge is updated to read those fields.
+- Frontend bundle now includes 4 new tabs (no other route changes).
+- 2 new backend endpoints (`/api/admin/recent-rejections`, `/api/admin/recent-signals`) — both admin-only, read-only, safe to deploy.
+- Backward compatibility: all new tabs work even when their config block is missing from the DB (defaults from `DEFAULT_CONFIG` auto-apply).
 
 ## Backlog
-- Module 4+: pending user spec
-- P1: Admin UI surfaces for adaptive_tp config + per-signal TP audit trail
-- P2: Walk-forward backtest of `priority` orderings per symbol from the persisted candidate diagnostics — admins could auto-select the best priority per pair.
+- Module 4+: pending user spec — UI will be added in the same shape automatically
+- P2: A unified "Pipeline" overview tab showing the full funnel (signal → regime → mtf → entry_quality → score → adaptive_tp) for any single bot's last scan
