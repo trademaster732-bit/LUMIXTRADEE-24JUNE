@@ -101,6 +101,67 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         },
     },
 
+    # ───── MODULE 1 (2026-01): Market Regime Detection ─────
+    # Classifies the current market into one of six regimes, then applies
+    # per-regime + per-symbol-preference gates and overrides. The classifier
+    # output is also persisted on every scan for diagnostics. Setting any
+    # regime's `enabled=false` disables trading in that regime; setting a
+    # symbol's preferences whitelists only the regimes admissible for that
+    # pair. See market_regime.py for the full classification rules.
+    "market_regime": {
+        "enabled": True,
+        "regimes": {
+            "strong_trend": {
+                "enabled": True,
+                "min_score": 70,                # easier to enter on strong trends
+                "entry_aggressiveness": "high",
+                "preferred_confirmation": ["engulfing", "momentum", "break"],
+            },
+            "weak_trend": {
+                "enabled": True,
+                "min_score": 75,
+                "entry_aggressiveness": "medium",
+                "preferred_confirmation": ["engulfing", "pin"],
+            },
+            "range": {
+                "enabled": True,
+                "min_score": 80,                # harder to enter inside chop
+                "entry_aggressiveness": "low",
+                "preferred_confirmation": ["pin", "engulfing"],
+            },
+            "breakout": {
+                "enabled": True,
+                "min_score": 72,
+                "entry_aggressiveness": "high",
+                "preferred_confirmation": ["momentum", "break"],
+            },
+            "high_volatility": {
+                "enabled": True,
+                "min_score": 78,
+                "entry_aggressiveness": "low",
+                "preferred_confirmation": ["engulfing", "pin"],
+            },
+            "low_volatility": {
+                "enabled": False,               # default OFF — typically no-trade
+                "min_score": 80,
+                "entry_aggressiveness": "low",
+                "preferred_confirmation": ["any"],
+            },
+        },
+        # Empty list / missing key = all enabled regimes allowed for that symbol.
+        # Listed regimes act as a whitelist (anything else is rejected).
+        "symbol_preferences": {
+            "EURUSD": ["strong_trend", "weak_trend", "breakout"],
+            "GBPUSD": ["strong_trend", "weak_trend", "breakout"],
+            "USDJPY": ["strong_trend", "weak_trend", "breakout"],
+            "AUDUSD": ["strong_trend", "weak_trend"],
+            "NZDUSD": ["strong_trend", "weak_trend"],
+            "USDCAD": ["strong_trend", "weak_trend", "breakout"],
+            "XAUUSD": ["breakout", "strong_trend", "high_volatility"],
+            "XAGUSD": ["breakout", "strong_trend", "range"],
+        },
+    },
+
     # ───── Symbol overrides — admin can add any of these keys per symbol ─────
     # NOTE (2026-01 commercial tuning): re-calibrated after diagnostic showed the
     # pre-fix metals threshold of 85 was mathematically unreachable during the
@@ -143,15 +204,33 @@ def invalidate_cache() -> None:
     _CACHE["expires_at"] = 0.0
 
 
+def _deep_update(base: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
+    """Recursive dict merge (lists/scalars treated as leaves — replaced).
+
+    Used for nested config blocks like ``market_regime.regimes.<name>`` and
+    ``entry_quality.profiles.<profile>`` so admins can patch a single inner
+    entry without having to resend the entire surrounding dict.
+    """
+    out = dict(base)
+    for k, v in (patch or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_update(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
 async def save_engine_config(db, patch: Dict[str, Any], *, admin_id: Optional[str] = None) -> Dict[str, Any]:
     """Merge-update the config doc. Returns the new merged doc.
 
     Merge semantics:
-      • ``score_weights`` and ``session_windows`` → deep-merged (one level) with
-        the existing doc so admins can patch individual keys.
-      • ``symbol_overrides`` → REPLACEMENT semantics. The full dict in the patch
-        becomes the new ``symbol_overrides`` (allowing removal of any entry by
-        omitting it). To keep an entry, callers must include it explicitly.
+      • ``score_weights`` and ``session_windows`` → one-level deep merge.
+      • ``entry_quality`` and ``market_regime`` → RECURSIVE deep merge so
+        individual nested entries (e.g. one regime, one symbol's preferences,
+        one profile) can be patched without resending the surrounding block.
+      • ``symbol_overrides`` → REPLACEMENT semantics. The full dict in the
+        patch becomes the new ``symbol_overrides`` (allowing removal of any
+        entry by omitting it). To keep an entry, callers must include it.
       • Everything else → shallow override.
     """
     existing = await db.engine_config.find_one({"_id": "global"}) or {}
@@ -160,7 +239,9 @@ async def save_engine_config(db, patch: Dict[str, Any], *, admin_id: Optional[st
         if k == "symbol_overrides":
             # Authoritative replacement (allows removing entries).
             merged[k] = dict(v) if isinstance(v, dict) else {}
-        elif k in ("score_weights", "session_windows", "entry_quality") and isinstance(v, dict):
+        elif k in ("entry_quality", "market_regime") and isinstance(v, dict):
+            merged[k] = _deep_update(existing.get(k) or {}, v)
+        elif k in ("score_weights", "session_windows") and isinstance(v, dict):
             base = dict(existing.get(k) or {})
             base.update(v)
             merged[k] = base
@@ -182,8 +263,9 @@ def _merge_defaults(doc: Dict[str, Any]) -> Dict[str, Any]:
     that key is explicitly present (even if empty/partial). Previously the
     defaults dict was re-injected on every read, which made it impossible for
     an admin to *remove* a per-symbol override (e.g. drop XAUUSD's hard-coded
-    85 floor). ``score_weights`` and ``session_windows`` keep the deep-merge
-    behavior because they are structurally tied to the scoring formula.
+    85 floor). ``entry_quality`` and ``market_regime`` are RECURSIVELY merged
+    on top of defaults so admins can ship partial patches without losing
+    inner entries (regimes / profiles / preferences).
     """
     out = dict(DEFAULT_CONFIG)
     has_overrides_key = isinstance(doc, dict) and ("symbol_overrides" in doc)
@@ -191,7 +273,9 @@ def _merge_defaults(doc: Dict[str, Any]) -> Dict[str, Any]:
         if k == "symbol_overrides":
             # Authoritative from DB doc — no re-injection from defaults.
             out[k] = dict(v) if isinstance(v, dict) else {}
-        elif k in ("score_weights", "session_windows", "entry_quality") and isinstance(v, dict):
+        elif k in ("entry_quality", "market_regime") and isinstance(v, dict):
+            out[k] = _deep_update(DEFAULT_CONFIG.get(k) or {}, v)
+        elif k in ("score_weights", "session_windows") and isinstance(v, dict):
             merged = dict(DEFAULT_CONFIG.get(k) or {})
             merged.update(v)
             out[k] = merged

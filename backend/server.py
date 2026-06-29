@@ -2412,19 +2412,94 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                     continue
 
             # ═════════════════════════════════════════════════════════════════
+            # MODULE 1 (2026-01) — Market Regime Detection.
+            # Classifies the market into one of six regimes (strong_trend,
+            # weak_trend, range, breakout, high_volatility, low_volatility) and
+            # applies per-regime + per-symbol-preference gates. The regime's
+            # min_score will override the per-symbol/global floor at the score
+            # gate below, and its entry_aggressiveness adjusts the Phase-2
+            # pullback floor used by entry_quality. See market_regime.py.
+            # ═════════════════════════════════════════════════════════════════
+            from market_regime import (evaluate_market_regime,
+                                       regime_allows_candle_pattern)
+            from quality_score import _adx as _adx_compute
+            _mr_cfg = _ec.get("market_regime") or {}
+            _adx_vals = _adx_compute(candles, 14) if candles else []
+            _mr = evaluate_market_regime(
+                symbol=_pair_up,
+                candles=candles, ema_fast=_ef, ema_slow=_es,
+                adx_vals=_adx_vals, atr_arr=_atr_arr_pre,
+                mr_cfg=_mr_cfg,
+            )
+            _mr_diag = {
+                "market_regime": _mr.regime,
+                "regime_confidence": _mr.confidence,
+                "regime_passed": _mr.passed,
+                "regime_enabled": _mr.regime_enabled,
+                "regime_min_score": _mr.regime_min_score,
+                "regime_aggressiveness": _mr.entry_aggressiveness,
+                "regime_preferred_confirmation": _mr.preferred_confirmation,
+                "regime_symbol_preferred": _mr.symbol_preferred,
+                "regime_adx": _mr.adx,
+                "regime_adx_slope": _mr.adx_slope,
+                "regime_atr_ratio": _mr.atr_ratio,
+                "regime_ema_sep_atr": _mr.ema_separation_atr,
+                "regime_rejection_reason": _mr.rejection_reason,
+            }
+            if _mr_cfg.get("enabled", True) and not _mr.passed:
+                _rej = f"market_regime:{_mr.rejection_reason}"
+                await db.bots.update_one({"_id": bot["_id"]}, {"$set": {
+                    "last_scan_at": now_iso(), "last_scan_result": _rej,
+                    "last_mode": _mode_badge,
+                    "last_daily_bias": _bias_value,
+                    **_mr_diag,
+                }})
+                await _funnel_record(bot, _rej)
+                await db.filter_rejections.insert_one({
+                    "ts": now_iso(), "bot_id": bot["_id"], "user_id": bot["user_id"],
+                    "pair": _pair_up, "filter": "market_regime", "reason": _rej,
+                    "side": sig.side, "regime_classification": _mr.regime,
+                    "regime_reasons": _mr.reasons,
+                    **_mr_diag,
+                })
+                continue
+
+            # ═════════════════════════════════════════════════════════════════
             # PHASE-2 (2026-01) — Entry Quality Engine.
             # Four post-strategy gates focused on ENTRY TIMING (not direction).
             # Each gate is independently toggleable via engine_config.entry_quality.
             # The module-1 score also feeds the quality_score as a weight-15 factor.
             # ═════════════════════════════════════════════════════════════════
             from entry_quality import evaluate_entry_quality
-            _eq_cfg = _ec.get("entry_quality") or {}
+            _eq_cfg = dict(_ec.get("entry_quality") or {})
+            # Apply regime aggressiveness: scale the pullback floor used by
+            # Module 1. <1.0 (high aggressiveness) lowers the bar; >1.0 raises it.
+            if _mr_cfg.get("enabled", True) and _mr.confirmation_multiplier != 1.0:
+                _base_floor = float(_eq_cfg.get("min_entry_confirmation_score", 10))
+                _eq_cfg["min_entry_confirmation_score"] = int(round(
+                    _base_floor * _mr.confirmation_multiplier
+                ))
             _eq_atr_now = _atr_arr_pre[-1] if _atr_arr_pre else 0.0
             _eq = evaluate_entry_quality(
                 side=sig.side, symbol=_pair_up, candles=candles,
                 ema_fast=_ef, ema_slow=_es, atr_now=_eq_atr_now,
-                eq_cfg=_eq_cfg,
+                eq_cfg=_eq_cfg, adx_vals=_adx_vals,
             )
+            # Regime-driven candle-pattern preference: if entry-quality detected
+            # a pattern but it isn't in the regime's preferred list, reject.
+            if (_mr_cfg.get("enabled", True) and _eq.passed
+                    and _eq.candle_pattern is not None
+                    and not regime_allows_candle_pattern(_mr, _eq.candle_pattern)):
+                _eq.passed = False
+                _eq.candle_passed = False
+                _eq.rejection_reason = (
+                    f"wrong_confirmation_pattern:{_eq.candle_pattern}"
+                    f"_not_in_{','.join(_mr.preferred_confirmation)}"
+                )
+                _eq.reasons.append(
+                    f"regime '{_mr.regime}' prefers "
+                    f"{_mr.preferred_confirmation} — got {_eq.candle_pattern}"
+                )
             # Diagnostic snapshot — persisted on EVERY outcome regardless of gate result.
             _eq_diag = {
                 "entry_quality_passed": _eq.passed,
@@ -2446,6 +2521,7 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                     "last_scan_at": now_iso(), "last_scan_result": _rej,
                     "last_mode": _mode_badge,
                     "last_daily_bias": _bias_value,
+                    **_mr_diag,
                     **_eq_diag,
                 }})
                 await _funnel_record(bot, _rej)
@@ -2453,6 +2529,7 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                     "ts": now_iso(), "bot_id": bot["_id"], "user_id": bot["user_id"],
                     "pair": _pair_up, "filter": "entry_quality", "reason": _rej,
                     "side": sig.side, "regime": _regime, "daily_bias": _bias_value,
+                    **_mr_diag,
                     **_eq_diag,
                 })
                 continue
@@ -2479,6 +2556,13 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                 ),
             )
             _min_score = int(get_symbol_setting(_ec, _pair_up, "min_score", 80))
+            # Module-1 (market_regime) override: when the active regime declares
+            # its own min_score, that becomes the effective floor. This is
+            # intentional — the whole purpose of the regime detector is to let
+            # admins tune entry strictness per market state.
+            if (_mr_cfg.get("enabled", True) and _mr.passed
+                    and _mr.regime_min_score is not None):
+                _min_score = int(_mr.regime_min_score)
             _score.threshold = _min_score
             _score.approved = _score.total >= _min_score
             log.info("[QUALITY-SCORE] %s %s · total=%d/%d (raw=%d/%d) · h4=%d h1=%d adx=%d vwap=%d sr=%d atr=%d spr=%d · bias=%s(-%d) · missing=%s · %s",
