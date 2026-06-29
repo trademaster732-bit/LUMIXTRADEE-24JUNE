@@ -2,75 +2,79 @@
 
 ## Phases completed
 - Phase 0: Deploy as-is from user ZIP
-- Phase 1: Diagnostic + commercial tuning (merge-bug fix, neutral penalty 15→5, warm-up handling)
-- Phase 2: Entry Quality Engine (4 modules + diagnostics + symbol profiles)
-- Phase 3 / Module 1: Market Regime Detection (6 regimes + symbol preferences)
-- **Phase 3 / Module 2: Multi-Timeframe Alignment** ← this session
+- Phase 1: Diagnostic + commercial tuning
+- Phase 2: Entry Quality Engine
+- Phase 3 / Module 1: Market Regime Detection (6 regimes + per-symbol whitelists)
+- Phase 3 / Module 2: Multi-Timeframe Alignment (D1/H4/H1/M15)
+- **Phase 3 / Module 3: Adaptive Take Profit Engine** ← this session
 
-## Module 2 — Multi-Timeframe Alignment (NEW, 2026-01)
+## Module 3 — Adaptive Take Profit Engine (NEW, 2026-01)
 
-**New file:** `/app/backend/mtf_alignment.py` (~230 LOC, fully self-contained).
+**New file:** `/app/backend/adaptive_tp.py` (~330 LOC, self-contained). **Stop loss is NEVER modified.**
 
-**Four timeframes evaluated in parallel:** D1, H4, H1, M15. Each TF returns:
-- `direction` — up / down / flat / unknown (EMA21 vs EMA55, 5-bp band, warm-up aware)
-- `adx` — Wilder ADX-14 latest value
-- `adx_slope` — 5-bar slope (rising = momentum present)
-- `ema_angle_bps` — signed basis-point slope of EMA21 over last 5 bars
-- `decisive` — direction ≠ flat AND ADX ≥ min_strength
-- `agrees` — direction matches signal side AND strength ≥ min AND angle ≥ min
+### 7 strategies, priority-ordered:
+1. **`static_rr`** — TP = entry ± `static_rr` × SL distance.
+2. **`atr`** — TP = entry ± `atr_multiplier` × ATR.
+3. **`swing`** — TP = nearest swing-high (buy) / swing-low (sell) from `_swings()` pivots, `swing_lookback` bars.
+4. **`sr`** — TP = nearest clustered S/R level (≥2 pivots within `sr_cluster_atr` × ATR), `sr_lookback` bars.
+5. **`structure`** — 1:1 measured-move projection from the last impulse leg's swing-low (buy) / swing-high (sell).
+6. **`partial_tp`** — generates `tp_levels[]` (rr + close_pct + tp price) — persisted as **auxiliary** on signal doc for the bridge to consume; does NOT replace primary TP.
+7. **`trailing`** — generates `trailing{}` payload (activate_at_rr, trail_distance_atr) — persisted as **auxiliary** on signal doc.
 
-**Per-TF configurable** (`engine_config.mtf_alignment.timeframes.<TF>`):
-- `enabled`, `weight`, `min_strength_adx`, `min_ema_angle_bps`
+### Orchestrator behavior:
+- Walks `priority` list — FIRST strategy that returns a valid TP wins.
+- All 5 level-strategy candidates are recorded in diagnostics (`tp_candidates`) for forensics.
+- Sanity bounds: TP is widened to `min_rr_floor` if too tight, clipped to `max_rr_cap` if too far.
+- Fallback: if every strategy fails, falls back to `static_rr@min_rr_floor`.
 
-**Default weights:** D1=30, H4=30, H1=25, M15=15 (sums to 100; admin can re-balance freely).
+### Per-symbol overrides (`adaptive_tp.symbol_overrides.<symbol>`):
+Default shipped:
+- **XAUUSD / XAGUSD** → `priority=[structure, swing, atr]`, `atr_multiplier=3.0`, `min_rr_floor=1.8`
+- **EURUSD / GBPUSD** → `priority=[sr, swing, structure, atr]`
 
-**Three hard gates:**
-1. **Weighted alignment %** — `agreed_weight / enabled_weight × 100` must clear `min_alignment_pct` (default 60). Below → reject with `alignment_pct:X<Y`.
-2. **HTF/LTF strong disagreement** — when D1 AND M15 are both decisive but opposite (e.g. D1=up, M15=down) → reject. Toggleable via `htf_ltf_disagreement_reject`.
-3. **Momentum agreement (optional)** — `require_momentum_agreement=true` requires ADX rising on ≥ `min_momentum_agreement_count` timeframes. Default OFF.
+### Default config: `enabled: false`
+Backward-compatible. Existing `sig.tp` (with strategy_v2's own min-RR enforcement) is used until admin opts in.
 
-**Wired into `server.py` between `market_regime` and `entry_quality`** — gates fire BEFORE the score gate. Order is now:
+### Wired into `server.py` immediately BEFORE `db.signals.insert_one`:
+- `sig.tp` is replaced with `_atp.primary_tp` when enabled.
+- New signal-doc fields persisted: `adaptive_tp{diag}`, `tp_levels[]`, `trailing{}`.
+- `notify_svc.notify(..., tp=sig.tp)` automatically gets the new TP (sig.tp is mutated).
 
-`signal → SR-cluster → market_regime → mtf_alignment → entry_quality → quality_score`
-
-**D1 candles** reconstructed via existing `aggregate_daily(H1)` — no new data sources, no bridge changes.
-**M15 candles** fetched fresh per scan (200 bars).
-**H1/H4** reuse existing fetches.
-
-**Diagnostics persisted on EVERY scan** (in `bots.last_*` + `filter_rejections`):
-`mtf_alignment_pct, mtf_aligned_count, mtf_enabled_count, mtf_momentum_agree_count, mtf_htf_dir, mtf_ltf_dir, mtf_htf_ltf_disagree, mtf_passed, mtf_rejection_reason, mtf_evaluations (full per-TF breakdown)`
+### Diagnostics persisted on EVERY approved signal:
+`adaptive_tp_enabled, tp_strategy (picked), tp_candidates (all 5), tp_rr_realized, tp_rr_floor_applied, tp_rr_cap_applied, tp_symbol_override_used, tp_reasons (full reasoning chain)`
 
 ### Explicitly NOT touched
-- Risk management, lot sizing, SL, TP
-- Session logic / `metals_blocked_sessions=["asia"]`
-- ATR band `[0.80, 2.00]`
-- Instrument cooldown (2 SL → 60 min)
-- Daily bias logic (penalty 5)
-- Quality-score architecture (score_weights sum still = 100)
-- Bridge endpoints, auth, frontend
-- Module-1 market_regime and Phase-2 entry_quality (untouched)
+- **Stop loss** (every gate, every code path)
+- Risk management, lot sizing, sessions, ATR band, cooldown, daily-bias, quality-score weights
+- Bridge endpoints (the bridge just sees new optional fields on signal docs — `tp_levels` and `trailing` — and can ignore them safely)
+- Auth, frontend, all Phase-1/Phase-2/Module-1/Module-2 logic
 
 ## Verification (preview env)
-- Lint clean across all changed files.
-- Five unit tests:
-  - Full uptrend → 3/4 TFs agree (D1 warm-up), 70% alignment → PASS.
-  - HTF/LTF disagreement on partial uptrend → rejected via alignment_pct gate.
-  - Buy signal vs full-down market → 0% alignment → reject.
-  - Empty candles → 0% alignment → reject (no crash).
-  - `enabled: false` → pass-through.
-- Recursive admin patch: PUT `{timeframes:{M15:{min_strength_adx:30}}, min_alignment_pct:75}` — M15 strength + global threshold updated; ALL untouched fields (M15.weight, D1.*, H4.*, H1.*) preserved.
+- Lint clean.
+- 8 unit tests covering: individual strategies, orchestrator default, engine-disabled passthrough, XAUUSD symbol override (min_rr_floor 1.5→1.8), partial-TP plan generation, trailing payload, SELL-on-uptrend fallback, min-RR floor enforcement.
+- Recursive admin patch: enabled `adaptive_tp.enabled=true` + tightened ONLY `XAUUSD.min_rr_floor` — every untouched field preserved (XAUUSD.priority, XAUUSD.atr_multiplier, XAGUSD entirely, partial_tp.levels).
 - Reset-defaults works.
-- Regression confirmed: ATR `[0.8, 2.0]`, cooldown 60, metals session, daily-bias penalty 5, score_weights sum 100, market_regime 6 regimes + 8 prefs, entry_quality enabled.
+- Full regression of all prior subsystems passed.
 
 ## Production deploy notes
-Old engine_config docs lack `mtf_alignment` → defaults auto-apply. To tune, single PUT:
+Old engine_config docs lack `adaptive_tp` → defaults auto-apply with `enabled=false`. To opt in:
 ```bash
 curl -X PUT https://lumixtrade.live/api/admin/engine-config \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"mtf_alignment":{"timeframes":{"D1":{"weight":40}},"min_alignment_pct":65}}'
+  -d '{"adaptive_tp":{"enabled":true}}'
 ```
 
+To enable partial closes + trailing on top:
+```bash
+curl -X PUT https://lumixtrade.live/api/admin/engine-config \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"adaptive_tp":{"enabled":true,"partial_tp":{"enabled":true},"trailing":{"enabled":true}}}'
+```
+
+## Bridge compatibility note
+- `tp_levels` and `trailing` are optional fields on the signal doc. Bridges built before Module 3 will simply ignore them and execute the primary `tp` (which already incorporates the adaptive choice). **No bridge update is required** to start benefiting from Module 3; partial-closes and trailing only activate once the bridge is updated to read those fields.
+
 ## Backlog
-- Module 3+: pending user spec
-- P1: Admin UI surfaces for the new MTF diagnostics + per-scan TF breakdown
-- P2: Per-regime + per-symbol auto-calibration from rolling win-rate using the rich diagnostic fields now persisted on every scan
+- Module 4+: pending user spec
+- P1: Admin UI surfaces for adaptive_tp config + per-signal TP audit trail
+- P2: Walk-forward backtest of `priority` orderings per symbol from the persisted candidate diagnostics — admins could auto-select the best priority per pair.

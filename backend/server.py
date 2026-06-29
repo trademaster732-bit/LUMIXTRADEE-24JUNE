@@ -2805,11 +2805,42 @@ async def _scan_and_persist(bots: List[dict]) -> int:
             # (every 5 s). Swing signals get the standard 30-min TTL.
             ttl_min = 5 if sig.mode == "scalp" else 30
             sid = str(uuid.uuid4())
+            # ═════════════════════════════════════════════════════════════════
+            # MODULE 3 (2026-01) — Adaptive Take Profit Engine.
+            # Replaces the static R:R-based sig.tp with a priority-ordered TP
+            # picked from market structure. SL is NEVER modified. tp_levels
+            # (partial TP) and trailing payload are persisted as extra fields
+            # for the bridge to consume. Default OFF; opt-in via admin endpoint.
+            # ═════════════════════════════════════════════════════════════════
+            from adaptive_tp import compute_adaptive_tp
+            _atp_cfg = _ec.get("adaptive_tp") or {}
+            _atp_atr_now = _atr_arr_pre[-1] if _atr_arr_pre else 0.0
+            _atp = compute_adaptive_tp(
+                side=sig.side, symbol=_pair_up,
+                entry=sig.entry, sl=sig.sl, atr_now=_atp_atr_now,
+                candles=candles,
+                candles_h1=_candles_h1_score, candles_h4=_candles_h4_score,
+                cfg=_atp_cfg,
+            )
+            _atp_diag = {
+                "adaptive_tp_enabled": _atp.enabled,
+                "tp_strategy": _atp.primary_strategy,
+                "tp_candidates": _atp.candidates,
+                "tp_rr_realized": _atp.rr_realized,
+                "tp_rr_floor_applied": _atp.rr_floor_applied,
+                "tp_rr_cap_applied": _atp.rr_cap_applied,
+                "tp_symbol_override_used": _atp.symbol_override_used,
+                "tp_reasons": _atp.reasons,
+            }
+            _tp_to_use = sig.tp
+            if _atp.enabled and _atp.primary_tp is not None:
+                _tp_to_use = float(_atp.primary_tp)
+                sig.tp = _tp_to_use   # propagate to notify_svc.notify(..., tp=sig.tp)
             await db.signals.insert_one({
                 "_id": sid,
                 "user_id": bot["user_id"], "bot_id": bot["_id"],
                 "pair": bot["pair"], "side": sig.side,
-                "entry": sig.entry, "sl": sig.sl, "tp": sig.tp,
+                "entry": sig.entry, "sl": sig.sl, "tp": _tp_to_use,
                 "lot": lot, "confidence": sig.confidence,
                 "regime": sig.regime, "session": sig.session, "reason": sig.reason,
                 "mode": sig.mode, "max_hold_minutes": sig.max_hold_minutes,
@@ -2830,6 +2861,10 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                 # Phase-1 (2026-06-22): quality-score + daily-bias telemetry for the journal
                 "quality_score": _score.to_dict(),
                 "daily_bias": _bias_value,
+                # Module-3 (2026-01): adaptive TP audit + auxiliary plan payloads
+                "adaptive_tp": _atp_diag,
+                "tp_levels": _atp.tp_levels,       # null when partial_tp disabled
+                "trailing": _atp.trailing,         # null when trailing disabled
             })
             # Fire-and-forget Telegram alert (admin-level channel for v1)
             try:

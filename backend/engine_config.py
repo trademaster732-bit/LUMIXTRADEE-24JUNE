@@ -188,6 +188,60 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "min_momentum_agreement_count": 2,
     },
 
+    # ───── MODULE 3 (2026-01): Adaptive Take Profit Engine ─────
+    # Priority-ordered TP chooser with five "level" strategies + optional
+    # partial-TP plan + optional trailing payload. SL is NEVER modified.
+    # Default OFF — opt-in via the admin endpoint to preserve current behavior.
+    # See adaptive_tp.py for the full evaluation chain.
+    "adaptive_tp": {
+        "enabled": False,
+        # First strategy that returns a valid TP price wins. Available:
+        # "static_rr", "atr", "swing", "sr", "structure".
+        "priority": ["structure", "swing", "sr", "atr", "static_rr"],
+        "static_rr": 2.0,
+        "atr_multiplier": 2.5,
+        "swing_lookback": 50,
+        "sr_lookback": 120,
+        "sr_cluster_atr": 0.5,
+        "structure_lookback": 40,
+        # Bounds — TP is widened if picked RR < min_rr_floor; clipped if > max_rr_cap.
+        "min_rr_floor": 1.5,
+        "max_rr_cap": 6.0,
+        # Partial TP — persisted as `tp_levels[]` on the signal doc. Bridge must
+        # support multi-TP execution to honor this; otherwise primary TP only.
+        "partial_tp": {
+            "enabled": False,
+            "levels": [
+                {"rr": 1.0, "close_pct": 50.0},
+                {"rr": 2.0, "close_pct": 30.0},
+                {"rr": 3.0, "close_pct": 20.0},
+            ],
+        },
+        # Trailing — persisted as `trailing{}` on the signal doc. Bridge consumes.
+        # Does NOT modify SL at signal-creation time; only the bridge moves SL.
+        "trailing": {
+            "enabled": False,
+            "activate_at_rr": 1.0,
+            "trail_distance_atr": 0.8,
+        },
+        # Per-symbol overrides — applied on top of the base config above. Any
+        # key that exists in the base can be overridden here per pair.
+        "symbol_overrides": {
+            "XAUUSD": {
+                "priority": ["structure", "swing", "atr"],
+                "atr_multiplier": 3.0,
+                "min_rr_floor": 1.8,
+            },
+            "XAGUSD": {
+                "priority": ["structure", "swing", "atr"],
+                "atr_multiplier": 3.0,
+                "min_rr_floor": 1.8,
+            },
+            "EURUSD": {"priority": ["sr", "swing", "structure", "atr"]},
+            "GBPUSD": {"priority": ["sr", "swing", "structure", "atr"]},
+        },
+    },
+
     # ───── Symbol overrides — admin can add any of these keys per symbol ─────
     # NOTE (2026-01 commercial tuning): re-calibrated after diagnostic showed the
     # pre-fix metals threshold of 85 was mathematically unreachable during the
@@ -265,7 +319,7 @@ async def save_engine_config(db, patch: Dict[str, Any], *, admin_id: Optional[st
         if k == "symbol_overrides":
             # Authoritative replacement (allows removing entries).
             merged[k] = dict(v) if isinstance(v, dict) else {}
-        elif k in ("entry_quality", "market_regime", "mtf_alignment") and isinstance(v, dict):
+        elif k in ("entry_quality", "market_regime", "mtf_alignment", "adaptive_tp") and isinstance(v, dict):
             merged[k] = _deep_update(existing.get(k) or {}, v)
         elif k in ("score_weights", "session_windows") and isinstance(v, dict):
             base = dict(existing.get(k) or {})
@@ -299,7 +353,7 @@ def _merge_defaults(doc: Dict[str, Any]) -> Dict[str, Any]:
         if k == "symbol_overrides":
             # Authoritative from DB doc — no re-injection from defaults.
             out[k] = dict(v) if isinstance(v, dict) else {}
-        elif k in ("entry_quality", "market_regime", "mtf_alignment") and isinstance(v, dict):
+        elif k in ("entry_quality", "market_regime", "mtf_alignment", "adaptive_tp") and isinstance(v, dict):
             out[k] = _deep_update(DEFAULT_CONFIG.get(k) or {}, v)
         elif k in ("score_weights", "session_windows") and isinstance(v, dict):
             merged = dict(DEFAULT_CONFIG.get(k) or {})
