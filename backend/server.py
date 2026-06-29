@@ -2411,7 +2411,53 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                     })
                     continue
 
-            # F1 — Trade-Quality Score (7 factors, 0-100). Needs H1 + H4 candle history.
+            # ═════════════════════════════════════════════════════════════════
+            # PHASE-2 (2026-01) — Entry Quality Engine.
+            # Four post-strategy gates focused on ENTRY TIMING (not direction).
+            # Each gate is independently toggleable via engine_config.entry_quality.
+            # The module-1 score also feeds the quality_score as a weight-15 factor.
+            # ═════════════════════════════════════════════════════════════════
+            from entry_quality import evaluate_entry_quality
+            _eq_cfg = _ec.get("entry_quality") or {}
+            _eq_atr_now = _atr_arr_pre[-1] if _atr_arr_pre else 0.0
+            _eq = evaluate_entry_quality(
+                side=sig.side, symbol=_pair_up, candles=candles,
+                ema_fast=_ef, ema_slow=_es, atr_now=_eq_atr_now,
+                eq_cfg=_eq_cfg,
+            )
+            # Diagnostic snapshot — persisted on EVERY outcome regardless of gate result.
+            _eq_diag = {
+                "entry_quality_passed": _eq.passed,
+                "pullback_score": _eq.pullback_score,
+                "entry_confirmation_score": _eq.entry_confirmation_score,
+                "trend_stage": _eq.trend_stage,
+                "momentum_accel": _eq.momentum_accel,
+                "momentum_score": _eq.momentum_score,
+                "sr_distance_atr": _eq.sr_distance_atr,
+                "sr_nearest_level": _eq.nearest_level,
+                "candle_pattern": _eq.candle_pattern,
+                "candle_confirmed": _eq.candle_confirmed,
+                "eq_profile": _eq.profile,
+                "eq_rejection_reason": _eq.rejection_reason,
+            }
+            if _eq_cfg.get("enabled", True) and not _eq.passed:
+                _rej = f"entry_quality:{_eq.rejection_reason}"
+                await db.bots.update_one({"_id": bot["_id"]}, {"$set": {
+                    "last_scan_at": now_iso(), "last_scan_result": _rej,
+                    "last_mode": _mode_badge,
+                    "last_daily_bias": _bias_value,
+                    **_eq_diag,
+                }})
+                await _funnel_record(bot, _rej)
+                await db.filter_rejections.insert_one({
+                    "ts": now_iso(), "bot_id": bot["_id"], "user_id": bot["user_id"],
+                    "pair": _pair_up, "filter": "entry_quality", "reason": _rej,
+                    "side": sig.side, "regime": _regime, "daily_bias": _bias_value,
+                    **_eq_diag,
+                })
+                continue
+
+            # F1 — Trade-Quality Score (8 factors, 0-100). Needs H1 + H4 candle history.
             try:
                 _candles_h1_score = await fetch_candles(bot["pair"], "H1", 200)
             except Exception:
@@ -2427,6 +2473,10 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                 cfg=_ec, signal_sl=sig.sl, signal_entry=sig.entry,
                 spread_at_fill=None,                      # broker spread checked at bridge fill time
                 sr_action=_sr_action, daily_bias_value=_bias_value,
+                entry_confirmation_score=(
+                    _eq.entry_confirmation_score
+                    if _eq_cfg.get("enabled", True) else None
+                ),
             )
             _min_score = int(get_symbol_setting(_ec, _pair_up, "min_score", 80))
             _score.threshold = _min_score
@@ -2449,6 +2499,8 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                 "last_missing_history": _score.missing_history,
                 "last_effective_min_score": _min_score,
                 "last_regime": _regime,
+                # Phase-2 entry-quality breakdown (single source of truth)
+                **_eq_diag,
             }
             if not _score.approved:
                 _is_near_miss = _near_lo <= _score.total < _min_score

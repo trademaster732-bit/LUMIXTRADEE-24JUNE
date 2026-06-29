@@ -25,15 +25,19 @@ from typing import Any, Dict, Optional
 # Default config (baseline). Edit via the admin UI; no redeploy needed.
 # ─────────────────────────────────────────────────────────────────────────────
 DEFAULT_CONFIG: Dict[str, Any] = {
-    # ───── FEATURE 1: Trade-Quality Score (7 factors, max 100) ─────
+    # ───── FEATURE 1: Trade-Quality Score (8 factors, max 100) ─────
+    # 2026-01 Phase-2: rebalanced to include `entry_confirmation` (15 pts) while
+    # keeping the total at 100. H4 (20→12) and H1 (20→13) yielded the 15 budget;
+    # both still individually outweigh ADX/VWAP. Total = 12+13+15+10+15+10+10+15 = 100.
     "score_weights": {
-        "h4_trend": 20,
-        "h1_trend": 20,
+        "h4_trend": 12,
+        "h1_trend": 13,
         "adx": 15,
         "vwap": 10,
         "sr": 15,
         "atr_ratio": 10,
         "spread": 10,
+        "entry_confirmation": 15,
     },
     "min_score": 70,                     # global threshold (per-symbol override allowed)
     "near_miss_lower": 65,               # log scores in [near_miss_lower, min_score) as near-misses
@@ -61,6 +65,41 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # ───── FEATURE 5: ATR-Ratio Filter ─────
     "atr_ratio_min": 0.80,
     "atr_ratio_max": 2.00,
+
+    # ───── PHASE-2 (2026-01): Entry Quality Engine ─────
+    # Four post-strategy, pre-execution gates that improve ENTRY TIMING. The
+    # underlying scoring architecture (above) is unchanged; this block only
+    # adds new gates and one new factor (entry_confirmation, weight 15).
+    # All gates are individually toggleable.
+    "entry_quality": {
+        "enabled": True,
+        # Module 1 — Pullback Completion (score 0-20)
+        "min_entry_confirmation_score": 10,    # gate: pullback_score < this → reject
+        # Module 2 — Dynamic SR Distance
+        "min_sr_distance_atr": 0.30,
+        # Module 3 — Trend Maturity
+        "fresh_trend_threshold": 1.0,          # × 20 bars = "fresh" window
+        "trend_exhaustion_threshold": 3.5,     # ATR-units of price-to-EMA distance
+        "momentum_threshold": 0.0,             # ADX 5-bar slope required to override extended/exhausted
+        # Module 4 — Candle Confirmation
+        "confirmation_candle_required": True,
+        "min_candle_body_pct": 0.55,           # for the "momentum" pattern
+        # ── Symbol-profile overrides — applied on top of the base config above ──
+        # Metals need stronger MOMENTUM confirmation (bigger candle bodies, tighter
+        # exhaustion threshold). Forex needs stronger PULLBACK confirmation
+        # (higher Module-1 floor). Both fully tunable from the admin endpoint.
+        "profiles": {
+            "metals": {
+                "min_candle_body_pct": 0.65,
+                "trend_exhaustion_threshold": 3.0,
+                "min_entry_confirmation_score": 9,
+            },
+            "forex": {
+                "min_candle_body_pct": 0.50,
+                "min_entry_confirmation_score": 12,
+            },
+        },
+    },
 
     # ───── Symbol overrides — admin can add any of these keys per symbol ─────
     # NOTE (2026-01 commercial tuning): re-calibrated after diagnostic showed the
@@ -121,7 +160,7 @@ async def save_engine_config(db, patch: Dict[str, Any], *, admin_id: Optional[st
         if k == "symbol_overrides":
             # Authoritative replacement (allows removing entries).
             merged[k] = dict(v) if isinstance(v, dict) else {}
-        elif k in ("score_weights", "session_windows") and isinstance(v, dict):
+        elif k in ("score_weights", "session_windows", "entry_quality") and isinstance(v, dict):
             base = dict(existing.get(k) or {})
             base.update(v)
             merged[k] = base
@@ -152,7 +191,7 @@ def _merge_defaults(doc: Dict[str, Any]) -> Dict[str, Any]:
         if k == "symbol_overrides":
             # Authoritative from DB doc — no re-injection from defaults.
             out[k] = dict(v) if isinstance(v, dict) else {}
-        elif k in ("score_weights", "session_windows") and isinstance(v, dict):
+        elif k in ("score_weights", "session_windows", "entry_quality") and isinstance(v, dict):
             merged = dict(DEFAULT_CONFIG.get(k) or {})
             merged.update(v)
             out[k] = merged

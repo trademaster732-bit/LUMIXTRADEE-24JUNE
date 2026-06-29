@@ -32,6 +32,7 @@ class ScoreBreakdown:
     sr: int = 0
     atr_ratio: int = 0
     spread: int = 0
+    entry_confirmation: int = 0     # Phase-2 (2026-01): pullback-completion derived
     # Penalties (subtracted from total; logged for audit)
     daily_bias_penalty: int = 0
     # Final
@@ -193,6 +194,7 @@ def score_trade(
     spread_at_fill: Optional[float] = None, # broker-reported live spread in price units
     sr_action: Optional[str] = None,        # "ok"|"flip"|None — from strategy_v2 _sr_check
     daily_bias_value: Optional[str] = None, # "bullish"|"bearish"|"neutral"|None
+    entry_confirmation_score: Optional[int] = None,  # Phase-2: 0-20 from entry_quality engine
 ) -> ScoreBreakdown:
     """Run the 7-factor score. Caller decides whether to honour the approval result."""
     w = cfg.get("score_weights") or {}
@@ -204,14 +206,17 @@ def score_trade(
     # If a factor cannot be evaluated (e.g. <60 H4 bars), its weight is excluded
     # from the denominator instead of silently awarded 0 — which previously made
     # the 100-point scale unreachable during HTF warm-up.
-    w_h4 = int(w.get("h4_trend", 20))
-    w_h1 = int(w.get("h1_trend", 20))
+    w_h4 = int(w.get("h4_trend", 12))
+    w_h1 = int(w.get("h1_trend", 13))
     w_adx = int(w.get("adx", 15))
     w_vwap = int(w.get("vwap", 10))
     w_sr = int(w.get("sr", 15))
     w_atr = int(w.get("atr_ratio", 10))
     w_spread = int(w.get("spread", 10))
-    available = w_h1 + w_adx + w_vwap + w_sr + w_atr + w_spread  # h4 added conditionally
+    w_entry = int(w.get("entry_confirmation", 15))
+    # h4_trend is added conditionally (warm-up); entry_confirmation is added when
+    # the caller provided a Phase-2 score, otherwise excluded from denominator.
+    available = w_h1 + w_adx + w_vwap + w_sr + w_atr + w_spread
 
     # 1. H4 trend — UNKNOWN when history < 60 bars (excluded from total + denominator)
     h4_short = len(candles_h4) < 60
@@ -295,6 +300,21 @@ def score_trade(
         # No live spread info — be neutral (no points, no penalty) and note it.
         b.reasons.append("Spread unknown — neutral")
 
+    # ───── Phase-2 (2026-01): Entry-Confirmation factor (0-w_entry) ─────
+    # Caller passes the 0-20 score from the entry_quality engine. Linear scale
+    # to the configured weight (default 15). Excluded from numerator+denominator
+    # when None (engine disabled or upstream skipped it) so the 0-100 scale
+    # remains meaningful — same backward-compat pattern as the H4 warm-up gate.
+    if entry_confirmation_score is not None:
+        available += w_entry
+        ec = max(0, min(20, int(entry_confirmation_score)))
+        b.entry_confirmation = int(round((ec / 20.0) * w_entry))
+        b.reasons.append(
+            f"Entry-confirmation {ec}/20 → {b.entry_confirmation}/{w_entry}"
+        )
+    else:
+        b.reasons.append("Entry-confirmation skipped (engine disabled)")
+
     # ───── Daily-bias penalty (Feature 4 — Option B: subtract points when neutral) ─────
     # 'unknown' (D1 history < 56 days) is treated as "no information" — it does
     # NOT incur the neutral penalty.
@@ -307,7 +327,8 @@ def score_trade(
         b.reasons.append("Daily bias unknown — D1 history short (no penalty)")
 
     # Raw sum of awarded factor points (pre-penalty, pre-normalization).
-    raw = (b.h4_trend + b.h1_trend + b.adx + b.vwap + b.sr + b.atr_ratio + b.spread)
+    raw = (b.h4_trend + b.h1_trend + b.adx + b.vwap + b.sr + b.atr_ratio
+           + b.spread + b.entry_confirmation)
     b.raw_score = max(0, raw - b.daily_bias_penalty)
     b.available_weight = max(1, available)
     # Normalize so the 0-100 scale (and the configured min_score) remain meaningful
